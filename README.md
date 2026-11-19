@@ -1,7 +1,11 @@
-# rabbitsim
+# rabbit-sim
 
 A single-binary, in-memory AMQP 0-9-1 broker for local development. Point any RabbitMQ client at it.
 
+    pip install rabbit-sim        # or: pipx install rabbit-sim / uvx rabbit-sim
+    rabbit-sim --port 5672 -v
+
+    # or from source
     cargo run --release -- --port 5672 -v
     # amqp://guest:guest@127.0.0.1:5672/
     # web UI + API: http://127.0.0.1:15672/   (--http-port 0 to disable)

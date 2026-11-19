@@ -34,13 +34,24 @@ pub struct BindRow {
 }
 
 pub enum Op {
-    Exchange { name: String, kind: String, auto_delete: bool },
+    Exchange {
+        name: String,
+        kind: String,
+        auto_delete: bool,
+    },
     DeleteExchange(String),
-    Queue { name: String, auto_delete: bool },
+    Queue {
+        name: String,
+        auto_delete: bool,
+    },
     DeleteQueue(String),
     Bind(BindRow),
     Unbind(BindRow),
-    Enqueue { id: i64, queue: String, msg: Arc<Msg> },
+    Enqueue {
+        id: i64,
+        queue: String,
+        msg: Arc<Msg>,
+    },
     Remove(Vec<i64>),
     Flush(mpsc::Sender<()>),
 }
@@ -88,7 +99,7 @@ impl Store {
         let loaded = load(&db).map_err(err)?;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
-            .name("rabbitsim-store".into())
+            .name("rabbit-sim-store".into())
             .spawn(move || writer(db, rx))
             .map_err(|e| e.to_string())?;
         Ok((Store { tx }, loaded))
@@ -108,16 +119,15 @@ impl Store {
 }
 
 fn load(db: &Connection) -> rusqlite::Result<Loaded> {
-    let mut l = Loaded::default();
-    l.exchanges = db
+    let exchanges = db
         .prepare("SELECT name, kind, auto_delete FROM exchanges")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))?
         .collect::<Result<_, _>>()?;
-    l.queues = db
+    let queues = db
         .prepare("SELECT name, auto_delete FROM queues")?
         .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?
         .collect::<Result<_, _>>()?;
-    l.bindings = db
+    let bindings = db
         .prepare("SELECT source, dest, dest_is_queue, key, args FROM bindings")?
         .query_map([], |r| {
             Ok(BindRow {
@@ -129,7 +139,7 @@ fn load(db: &Connection) -> rusqlite::Result<Loaded> {
             })
         })?
         .collect::<Result<_, _>>()?;
-    l.messages = db
+    let messages = db
         .prepare("SELECT id, queue, exchange, routing_key, props, body FROM messages ORDER BY id")?
         .query_map([], |r| {
             Ok(StoredMsg {
@@ -142,7 +152,12 @@ fn load(db: &Connection) -> rusqlite::Result<Loaded> {
             })
         })?
         .collect::<Result<_, _>>()?;
-    Ok(l)
+    Ok(Loaded {
+        exchanges,
+        queues,
+        bindings,
+        messages,
+    })
 }
 
 fn writer(mut db: Connection, rx: mpsc::Receiver<Op>) {
@@ -188,22 +203,33 @@ fn writer(mut db: Connection, rx: mpsc::Receiver<Op>) {
 
 fn apply(tx: &Transaction, op: Op) -> rusqlite::Result<()> {
     match op {
-        Op::Exchange { name, kind, auto_delete } => {
-            tx.prepare_cached("INSERT OR REPLACE INTO exchanges(name, kind, auto_delete) VALUES(?1, ?2, ?3)")?
-                .execute(params![name, kind, auto_delete])?;
+        Op::Exchange {
+            name,
+            kind,
+            auto_delete,
+        } => {
+            tx.prepare_cached(
+                "INSERT OR REPLACE INTO exchanges(name, kind, auto_delete) VALUES(?1, ?2, ?3)",
+            )?
+            .execute(params![name, kind, auto_delete])?;
         }
         Op::DeleteExchange(name) => {
-            tx.prepare_cached("DELETE FROM exchanges WHERE name = ?1")?.execute([&name])?;
-            tx.prepare_cached("DELETE FROM bindings WHERE source = ?1 OR (dest = ?1 AND dest_is_queue = 0)")?
+            tx.prepare_cached("DELETE FROM exchanges WHERE name = ?1")?
                 .execute([&name])?;
+            tx.prepare_cached(
+                "DELETE FROM bindings WHERE source = ?1 OR (dest = ?1 AND dest_is_queue = 0)",
+            )?
+            .execute([&name])?;
         }
         Op::Queue { name, auto_delete } => {
             tx.prepare_cached("INSERT OR REPLACE INTO queues(name, auto_delete) VALUES(?1, ?2)")?
                 .execute(params![name, auto_delete])?;
         }
         Op::DeleteQueue(name) => {
-            tx.prepare_cached("DELETE FROM queues WHERE name = ?1")?.execute([&name])?;
-            tx.prepare_cached("DELETE FROM messages WHERE queue = ?1")?.execute([&name])?;
+            tx.prepare_cached("DELETE FROM queues WHERE name = ?1")?
+                .execute([&name])?;
+            tx.prepare_cached("DELETE FROM messages WHERE queue = ?1")?
+                .execute([&name])?;
             tx.prepare_cached("DELETE FROM bindings WHERE dest = ?1 AND dest_is_queue = 1")?
                 .execute([&name])?;
         }

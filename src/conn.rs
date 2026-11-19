@@ -90,7 +90,12 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
     // start-ok
     let f = read_frame(&mut rd).await?;
     let mut r = R::new(&f.payload);
-    if f.ty != FRAME_METHOD || (r.u16().map_err(|_| bad("frame"))?, r.u16().map_err(|_| bad("frame"))?) != (10, 11) {
+    if f.ty != FRAME_METHOD
+        || (
+            r.u16().map_err(|_| bad("frame"))?,
+            r.u16().map_err(|_| bad("frame"))?,
+        ) != (10, 11)
+    {
         return Err(bad("expected connection.start-ok"));
     }
 
@@ -103,33 +108,50 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
     .await?;
     let f = read_frame(&mut rd).await?;
     let mut r = R::new(&f.payload);
-    let (c, m) = (r.u16().map_err(|_| bad("frame"))?, r.u16().map_err(|_| bad("frame"))?);
+    let (c, m) = (
+        r.u16().map_err(|_| bad("frame"))?,
+        r.u16().map_err(|_| bad("frame"))?,
+    );
     if f.ty != FRAME_METHOD || (c, m) != (10, 31) {
         return Err(bad("expected connection.tune-ok"));
     }
     let _chmax = r.u16().map_err(|_| bad("frame"))?;
     let fm = r.u32().map_err(|_| bad("frame"))?;
     let heartbeat = r.u16().map_err(|_| bad("frame"))?;
-    let frame_max = if fm == 0 || fm > MAX_FRAME { MAX_FRAME } else { fm.max(4096) } as usize;
+    let frame_max = if fm == 0 || fm > MAX_FRAME {
+        MAX_FRAME
+    } else {
+        fm.max(4096)
+    } as usize;
 
     // connection.open
     let f = read_frame(&mut rd).await?;
     let mut r = R::new(&f.payload);
-    let (c, m) = (r.u16().map_err(|_| bad("frame"))?, r.u16().map_err(|_| bad("frame"))?);
+    let (c, m) = (
+        r.u16().map_err(|_| bad("frame"))?,
+        r.u16().map_err(|_| bad("frame"))?,
+    );
     if f.ty != FRAME_METHOD || (c, m) != (10, 40) {
         return Err(bad("expected connection.open"));
     }
 
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     let peer_s = peer.map_or("?".to_string(), |p| p.to_string());
-    let id = broker.lock().unwrap().register(tx.clone(), frame_max, peer_s.clone());
+    let id = broker
+        .lock()
+        .unwrap()
+        .register(tx.clone(), frame_max, peer_s.clone());
     if verbose {
         eprintln!("[{id}] connected from {peer_s}");
     }
 
     // Writer task: owns the write half, also emits heartbeats.
     tokio::spawn(async move {
-        let period = Duration::from_secs(if heartbeat > 0 { (heartbeat as u64 / 2).max(1) } else { 3600 });
+        let period = Duration::from_secs(if heartbeat > 0 {
+            (heartbeat as u64 / 2).max(1)
+        } else {
+            3600
+        });
         let mut tick = interval_at(Instant::now() + period, period);
         loop {
             tokio::select! {
@@ -160,7 +182,12 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
 
     loop {
         let f = if heartbeat > 0 {
-            match timeout(Duration::from_secs(heartbeat as u64 * 2), read_frame(&mut rd)).await {
+            match timeout(
+                Duration::from_secs(heartbeat as u64 * 2),
+                read_frame(&mut rd),
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(_) => break,
             }
@@ -204,7 +231,10 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
     }
     broker.lock().unwrap().close_conn(id);
     // Let the client hang up first so it can read close/close-ok before EOF.
-    let _ = timeout(Duration::from_secs(1), async { while read_frame(&mut rd).await.is_ok() {} }).await;
+    let _ = timeout(Duration::from_secs(1), async {
+        while read_frame(&mut rd).await.is_ok() {}
+    })
+    .await;
     if verbose {
         eprintln!("[{id}] disconnected");
     }
@@ -222,13 +252,19 @@ impl Conn {
             FRAME_METHOD => self.on_method(f),
             FRAME_HEADER => {
                 let Some(st) = self.channels.get_mut(&f.ch) else {
-                    return Err(AmqpErr::conn(CHANNEL_ERROR, "CHANNEL_ERROR - unexpected content header"));
+                    return Err(AmqpErr::conn(
+                        CHANNEL_ERROR,
+                        "CHANNEL_ERROR - unexpected content header",
+                    ));
                 };
                 if st.closing {
                     return Ok(false);
                 }
                 let Some(p) = st.pending.as_mut().filter(|p| p.props.is_none()) else {
-                    return Err(AmqpErr::conn(UNEXPECTED_FRAME, "UNEXPECTED_FRAME - unexpected content header"));
+                    return Err(AmqpErr::conn(
+                        UNEXPECTED_FRAME,
+                        "UNEXPECTED_FRAME - unexpected content header",
+                    ));
                 };
                 let mut r = R::new(&f.payload);
                 let _class = r.u16()?;
@@ -246,29 +282,45 @@ impl Conn {
             }
             FRAME_BODY => {
                 let Some(st) = self.channels.get_mut(&f.ch) else {
-                    return Err(AmqpErr::conn(CHANNEL_ERROR, "CHANNEL_ERROR - unexpected content body"));
+                    return Err(AmqpErr::conn(
+                        CHANNEL_ERROR,
+                        "CHANNEL_ERROR - unexpected content body",
+                    ));
                 };
                 if st.closing {
                     return Ok(false);
                 }
                 let Some(p) = st.pending.as_mut().filter(|p| p.props.is_some()) else {
-                    return Err(AmqpErr::conn(UNEXPECTED_FRAME, "UNEXPECTED_FRAME - unexpected content body"));
+                    return Err(AmqpErr::conn(
+                        UNEXPECTED_FRAME,
+                        "UNEXPECTED_FRAME - unexpected content body",
+                    ));
                 };
                 p.body.extend_from_slice(&f.payload);
                 if p.body.len() as u64 > p.size {
-                    return Err(AmqpErr::conn(FRAME_ERROR, "FRAME_ERROR - content body larger than declared"));
+                    return Err(AmqpErr::conn(
+                        FRAME_ERROR,
+                        "FRAME_ERROR - content body larger than declared",
+                    ));
                 }
                 if p.body.len() as u64 == p.size {
                     self.finish_publish(f.ch)?;
                 }
                 Ok(false)
             }
-            _ => Err(AmqpErr::conn(FRAME_ERROR, "FRAME_ERROR - unknown frame type")),
+            _ => Err(AmqpErr::conn(
+                FRAME_ERROR,
+                "FRAME_ERROR - unknown frame type",
+            )),
         }
     }
 
     fn finish_publish(&mut self, ch: u16) -> Res<()> {
-        let p = self.channels.get_mut(&ch).and_then(|s| s.pending.take()).unwrap();
+        let p = self
+            .channels
+            .get_mut(&ch)
+            .and_then(|s| s.pending.take())
+            .unwrap();
         let msg = Arc::new(Msg {
             exchange: p.exchange.clone(),
             routing_key: p.rk.clone(),
@@ -277,7 +329,10 @@ impl Conn {
             body: p.body,
             persistent: p.persistent,
         });
-        self.broker.lock().unwrap().publish(self.id, ch, &p.exchange, &p.rk, p.mandatory, msg)
+        self.broker
+            .lock()
+            .unwrap()
+            .publish(self.id, ch, &p.exchange, &p.rk, p.mandatory, msg)
     }
 
     fn queue_name(&self, q: String) -> String {
@@ -297,7 +352,10 @@ impl Conn {
 
         if class == 10 {
             if ch != 0 {
-                return Err(AmqpErr::conn(COMMAND_INVALID, "COMMAND_INVALID - connection method on non-zero channel"));
+                return Err(AmqpErr::conn(
+                    COMMAND_INVALID,
+                    "COMMAND_INVALID - connection method on non-zero channel",
+                ));
             }
             return match m {
                 50 => {
@@ -305,25 +363,43 @@ impl Conn {
                     Ok(true)
                 }
                 51 => Ok(true),
-                _ => Err(AmqpErr::conn(COMMAND_INVALID, "COMMAND_INVALID - unexpected connection method")),
+                _ => Err(AmqpErr::conn(
+                    COMMAND_INVALID,
+                    "COMMAND_INVALID - unexpected connection method",
+                )),
             };
         }
         if ch == 0 {
-            return Err(AmqpErr::conn(CHANNEL_ERROR, "CHANNEL_ERROR - method on channel 0"));
+            return Err(AmqpErr::conn(
+                CHANNEL_ERROR,
+                "CHANNEL_ERROR - method on channel 0",
+            ));
         }
 
         // channel lifecycle
         if (class, m) == (20, 10) {
             if self.channels.contains_key(&ch) || ch > CHANNEL_MAX {
-                return Err(AmqpErr::conn(CHANNEL_ERROR, "CHANNEL_ERROR - second 'channel.open' seen"));
+                return Err(AmqpErr::conn(
+                    CHANNEL_ERROR,
+                    "CHANNEL_ERROR - second 'channel.open' seen",
+                ));
             }
-            self.channels.insert(ch, ChState { pending: None, closing: false });
+            self.channels.insert(
+                ch,
+                ChState {
+                    pending: None,
+                    closing: false,
+                },
+            );
             self.broker.lock().unwrap().open_chan(self.id, ch);
             self.send(method(ch, 20, 11, |w| w.long(b"")));
             return Ok(false);
         }
         let Some(st) = self.channels.get_mut(&ch) else {
-            return Err(AmqpErr::conn(CHANNEL_ERROR, "CHANNEL_ERROR - expected 'channel.open'"));
+            return Err(AmqpErr::conn(
+                CHANNEL_ERROR,
+                "CHANNEL_ERROR - expected 'channel.open'",
+            ));
         };
         if st.closing {
             match (class, m) {
@@ -372,7 +448,10 @@ impl Conn {
                 r.u16()?;
                 let name = r.short()?;
                 let bits = r.u8()?;
-                self.broker.lock().unwrap().delete_exchange(&name, bits & 1 != 0)?;
+                self.broker
+                    .lock()
+                    .unwrap()
+                    .delete_exchange(&name, bits & 1 != 0)?;
                 if bits & 2 == 0 {
                     self.send(method(ch, 40, 21, |_| {}));
                 }
@@ -450,7 +529,12 @@ impl Conn {
                 r.u16()?;
                 let q = self.queue_name(r.short()?);
                 let bits = r.u8()?;
-                let n = self.broker.lock().unwrap().delete_queue(self.id, &q, bits & 1 != 0, bits & 2 != 0)?;
+                let n = self.broker.lock().unwrap().delete_queue(
+                    self.id,
+                    &q,
+                    bits & 1 != 0,
+                    bits & 2 != 0,
+                )?;
                 if bits & 4 == 0 {
                     self.send(method(ch, 50, 41, |w| w.u32(n)));
                 }
@@ -460,7 +544,10 @@ impl Conn {
             (60, 10) => {
                 let _size = r.u32()?;
                 let count = r.u16()?;
-                self.broker.lock().unwrap().set_prefetch(self.id, ch, count as u32);
+                self.broker
+                    .lock()
+                    .unwrap()
+                    .set_prefetch(self.id, ch, count as u32);
                 self.send(method(ch, 60, 11, |_| {}));
             }
             (60, 20) => {
@@ -508,17 +595,29 @@ impl Conn {
             (60, 80) => {
                 let tag = r.u64()?;
                 let multiple = r.u8()? & 1 != 0;
-                self.broker.lock().unwrap().settle(self.id, ch, tag, multiple, None)?;
+                self.broker
+                    .lock()
+                    .unwrap()
+                    .settle(self.id, ch, tag, multiple, None)?;
             }
             (60, 90) => {
                 let tag = r.u64()?;
                 let requeue = r.u8()? & 1 != 0;
-                self.broker.lock().unwrap().settle(self.id, ch, tag, false, Some(requeue))?;
+                self.broker
+                    .lock()
+                    .unwrap()
+                    .settle(self.id, ch, tag, false, Some(requeue))?;
             }
             (60, 120) => {
                 let tag = r.u64()?;
                 let bits = r.u8()?;
-                self.broker.lock().unwrap().settle(self.id, ch, tag, bits & 1 != 0, Some(bits & 2 != 0))?;
+                self.broker.lock().unwrap().settle(
+                    self.id,
+                    ch,
+                    tag,
+                    bits & 1 != 0,
+                    Some(bits & 2 != 0),
+                )?;
             }
             (60, 100) => {
                 self.broker.lock().unwrap().recover(self.id, ch);
@@ -538,7 +637,10 @@ impl Conn {
             }
 
             (90, _) => {
-                return Err(AmqpErr::conn(NOT_IMPLEMENTED, "NOT_IMPLEMENTED - transactions (tx.*) are not supported"));
+                return Err(AmqpErr::conn(
+                    NOT_IMPLEMENTED,
+                    "NOT_IMPLEMENTED - transactions (tx.*) are not supported",
+                ));
             }
             _ => {
                 return Err(AmqpErr::conn(

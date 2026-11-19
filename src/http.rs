@@ -13,7 +13,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            let hex = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
             if let Some(v) = hex {
                 out.push(v);
                 i += 3;
@@ -54,10 +56,18 @@ fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
             let name = percent_decode(mid.split_once('/').map_or(mid, |(_, n)| n));
             match broker.lock().unwrap().purge_admin(&name) {
                 Some(n) => json(&format!("{{\"purged\":{n}}}")),
-                None => respond("404 Not Found", "application/json", "{\"error\":\"no such queue\"}"),
+                None => respond(
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"no such queue\"}",
+                ),
             }
         }
-        _ => respond("404 Not Found", "application/json", "{\"error\":\"not found\"}"),
+        _ => respond(
+            "404 Not Found",
+            "application/json",
+            "{\"error\":\"not found\"}",
+        ),
     }
 }
 

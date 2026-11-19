@@ -1,0 +1,155 @@
+name: Release
+
+# Runs when a GitHub Release is published, e.g.:
+#   gh release create v1.2.3 --generate-notes
+# Builds binaries (attached to that release) and wheels (published to PyPI).
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    name: Build binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive-name: rabbit-sim-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive-name: rabbit-sim-windows-x86_64.zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive-name: rabbit-sim-macos-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive-name: rabbit-sim-macos-arm64.tar.gz
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+    - name: Set version from release tag
+      shell: bash
+      run: sed -i.bak "s/^version = \"0.0.0-dev\"/version = \"${TAG#v}\"/" Cargo.toml
+
+    - name: Build release binary
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Create archive (Unix)
+      if: matrix.os != 'windows-latest'
+      run: |
+        cd target/${{ matrix.target }}/release
+        tar czf ../../../${{ matrix.archive-name }} rabbit-sim
+        cd -
+
+    - name: Create archive (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        cd target/${{ matrix.target }}/release
+        7z a ../../../${{ matrix.archive-name }} rabbit-sim.exe
+        cd -
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.archive-name }}
+        path: ${{ matrix.archive-name }}
+
+  upload-binaries:
+    name: Attach binaries to release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+        pattern: rabbit-sim-*
+        merge-multiple: true
+
+    - name: Upload to release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release upload "$TAG" artifacts/* --clobber --repo "${{ github.repository }}"
+
+  build-wheels:
+    name: Build wheel (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set version from release tag
+      shell: bash
+      run: sed -i.bak "s/^version = \"0.0.0-dev\"/version = \"${TAG#v}\"/" Cargo.toml
+
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        target: ${{ matrix.target }}
+        args: --release --out dist
+        manylinux: auto
+
+    - name: Upload wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.target }}
+        path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC token for PyPI Trusted Publishing
+    steps:
+    - name: Download all wheels
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+        pattern: wheels-*
+        merge-multiple: true
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: dist/

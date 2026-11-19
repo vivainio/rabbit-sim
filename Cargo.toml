@@ -1,8 +1,13 @@
 [package]
-name = "rabbitsim"
-version = "0.1.0"
+name = "rabbit-sim"
+version = "0.0.0-dev"
 edition = "2021"
-description = "Single-binary, in-memory AMQP 0-9-1 broker for local development"
+description = "Single-binary, in-memory AMQP 0-9-1 broker (RabbitMQ-compatible) for local development, with optional SQLite persistence"
+license = "MIT"
+repository = "https://github.com/vivainio/rabbit-sim"
+readme = "README.md"
+keywords = ["rabbitmq", "amqp", "broker", "testing", "simulator"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 rusqlite = { version = "0.43.0", features = ["bundled"] }

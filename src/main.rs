@@ -1,8 +1,8 @@
 use tokio::net::TcpListener;
 
-const USAGE: &str = "rabbitsim - in-memory AMQP 0-9-1 broker for local development
+const USAGE: &str = "rabbit-sim - in-memory AMQP 0-9-1 broker for local development
 
-USAGE: rabbitsim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [-v]
+USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [-v]
 
   -b, --bind ADDR   address to listen on (default 127.0.0.1)
   -p, --port PORT   AMQP port (default 5672)
@@ -40,10 +40,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("rabbitsim listening on amqp://{addr}");
+    eprintln!("rabbit-sim listening on amqp://{addr}");
     let broker = match &data {
-        None => rabbitsim::new_broker(),
-        Some(path) => match rabbitsim::open_broker(path) {
+        None => rabbit_sim::new_broker(),
+        Some(path) => match rabbit_sim::open_broker(path) {
             Ok(b) => {
                 let (q, m) = b.lock().unwrap().counts();
                 eprintln!("persistence: {path} ({q} queues, {m} messages restored)");
@@ -60,7 +60,7 @@ async fn main() {
         match TcpListener::bind(&haddr).await {
             Ok(l) => {
                 eprintln!("management UI on http://{haddr}/");
-                tokio::spawn(rabbitsim::serve_http(l, broker.clone()));
+                tokio::spawn(rabbit_sim::serve_http(l, broker.clone()));
             }
             Err(e) => eprintln!("management UI disabled, cannot bind {haddr}: {e}"),
         }
@@ -78,8 +78,8 @@ async fn main() {
         }
     };
     tokio::select! {
-        _ = rabbitsim::serve_amqp(listener, broker.clone(), verbose) => {}
+        _ = rabbit_sim::serve_amqp(listener, broker.clone(), verbose) => {}
         _ = shutdown => eprintln!("shutting down"),
     }
-    rabbitsim::flush(&broker);
+    rabbit_sim::flush(&broker);
 }

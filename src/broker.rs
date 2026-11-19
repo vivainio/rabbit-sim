@@ -143,14 +143,26 @@ fn bind_row(source: &str, b: &Binding) -> BindRow {
         Dest::Queue(q) => (q.clone(), true),
         Dest::Exchange(x) => (x.clone(), false),
     };
-    BindRow { source: source.into(), dest, dest_is_queue, key: b.key.clone(), args: encode_args(&b.args) }
+    BindRow {
+        source: source.into(),
+        dest,
+        dest_is_queue,
+        key: b.key.clone(),
+        args: encode_args(&b.args),
+    }
 }
 
 fn no_queue(n: &str) -> AmqpErr {
-    AmqpErr::chan(NOT_FOUND, format!("NOT_FOUND - no queue '{n}' in vhost '/'"))
+    AmqpErr::chan(
+        NOT_FOUND,
+        format!("NOT_FOUND - no queue '{n}' in vhost '/'"),
+    )
 }
 fn no_exchange(n: &str) -> AmqpErr {
-    AmqpErr::chan(NOT_FOUND, format!("NOT_FOUND - no exchange '{n}' in vhost '/'"))
+    AmqpErr::chan(
+        NOT_FOUND,
+        format!("NOT_FOUND - no exchange '{n}' in vhost '/'"),
+    )
 }
 
 pub fn topic_match(pat: &str, key: &str) -> bool {
@@ -197,7 +209,13 @@ impl Broker {
         ] {
             b.exchanges.insert(
                 n.into(),
-                Exchange { kind: k, durable: true, auto_delete: false, bindings: vec![], had_bindings: false },
+                Exchange {
+                    kind: k,
+                    durable: true,
+                    auto_delete: false,
+                    bindings: vec![],
+                    had_bindings: false,
+                },
             );
         }
         b
@@ -211,7 +229,13 @@ impl Broker {
             if let Some(kind) = Kind::parse(&kind) {
                 b.exchanges.insert(
                     name,
-                    Exchange { kind, durable: true, auto_delete, bindings: vec![], had_bindings: false },
+                    Exchange {
+                        kind,
+                        durable: true,
+                        auto_delete,
+                        bindings: vec![],
+                        had_bindings: false,
+                    },
                 );
             }
         }
@@ -230,19 +254,29 @@ impl Broker {
             );
         }
         for r in l.bindings {
-            let dest = if r.dest_is_queue { Dest::Queue(r.dest) } else { Dest::Exchange(r.dest) };
+            let dest = if r.dest_is_queue {
+                Dest::Queue(r.dest)
+            } else {
+                Dest::Exchange(r.dest)
+            };
             let dest_ok = match &dest {
                 Dest::Queue(q) => b.queues.contains_key(q),
                 Dest::Exchange(x) => b.exchanges.contains_key(x),
             };
             if let (true, Some(e)) = (dest_ok, b.exchanges.get_mut(&r.source)) {
-                e.bindings.push(Binding { dest, key: r.key, args: decode_args(&r.args) });
+                e.bindings.push(Binding {
+                    dest,
+                    key: r.key,
+                    args: decode_args(&r.args),
+                });
                 e.had_bindings = true;
             }
         }
         for m in l.messages {
             b.next_msg = b.next_msg.max(m.id);
-            let Some(q) = b.queues.get_mut(&m.queue) else { continue };
+            let Some(q) = b.queues.get_mut(&m.queue) else {
+                continue;
+            };
             let headers = props_headers(&m.props).unwrap_or_default();
             let msg = Arc::new(Msg {
                 exchange: m.exchange,
@@ -252,7 +286,11 @@ impl Broker {
                 body: m.body,
                 persistent: true,
             });
-            q.msgs.push_back(Entry { msg, redelivered: false, id: m.id });
+            q.msgs.push_back(Entry {
+                msg,
+                redelivered: false,
+                id: m.id,
+            });
         }
         b.store = Some(store);
         b.storage = Some(path.to_string());
@@ -261,7 +299,10 @@ impl Broker {
 
     /// (queues, ready messages) currently held — used for the startup banner.
     pub fn counts(&self) -> (usize, usize) {
-        (self.queues.len(), self.queues.values().map(|q| q.msgs.len()).sum())
+        (
+            self.queues.len(),
+            self.queues.values().map(|q| q.msgs.len()).sum(),
+        )
     }
 
     pub fn store(&self) -> Option<Store> {
@@ -283,19 +324,35 @@ impl Broker {
 
     pub fn register(&mut self, tx: Tx, frame_max: usize, peer: String) -> ConnId {
         self.next_conn += 1;
-        self.conns.insert(self.next_conn, ConnInfo { tx, frame_max, peer });
+        self.conns.insert(
+            self.next_conn,
+            ConnInfo {
+                tx,
+                frame_max,
+                peer,
+            },
+        );
         self.next_conn
     }
 
     pub fn open_chan(&mut self, conn: ConnId, ch: u16) {
-        self.chans.insert((conn, ch), Chan { next_tag: 1, ..Default::default() });
+        self.chans.insert(
+            (conn, ch),
+            Chan {
+                next_tag: 1,
+                ..Default::default()
+            },
+        );
     }
 
     pub fn close_chan(&mut self, conn: ConnId, ch: u16) {
-        let Some(c) = self.chans.remove(&(conn, ch)) else { return };
+        let Some(c) = self.chans.remove(&(conn, ch)) else {
+            return;
+        };
         for (tag, qn) in &c.consumers {
             if let Some(q) = self.queues.get_mut(qn) {
-                q.consumers.retain(|x| !(x.conn == conn && x.ch == ch && x.tag == *tag));
+                q.consumers
+                    .retain(|x| !(x.conn == conn && x.ch == ch && x.tag == *tag));
             }
             self.maybe_autodelete(qn);
         }
@@ -318,7 +375,12 @@ impl Broker {
     }
 
     pub fn close_conn(&mut self, conn: ConnId) {
-        let chs: Vec<u16> = self.chans.keys().filter(|(c, _)| *c == conn).map(|(_, ch)| *ch).collect();
+        let chs: Vec<u16> = self
+            .chans
+            .keys()
+            .filter(|(c, _)| *c == conn)
+            .map(|(_, ch)| *ch)
+            .collect();
         for ch in chs {
             self.close_chan(conn, ch);
         }
@@ -381,14 +443,27 @@ impl Broker {
             ));
         }
         let k = Kind::parse(kind).ok_or_else(|| {
-            AmqpErr::conn(COMMAND_INVALID, format!("COMMAND_INVALID - invalid exchange type '{kind}'"))
+            AmqpErr::conn(
+                COMMAND_INVALID,
+                format!("COMMAND_INVALID - invalid exchange type '{kind}'"),
+            )
         })?;
         self.exchanges.insert(
             name.into(),
-            Exchange { kind: k, durable, auto_delete, bindings: vec![], had_bindings: false },
+            Exchange {
+                kind: k,
+                durable,
+                auto_delete,
+                bindings: vec![],
+                had_bindings: false,
+            },
         );
         if durable {
-            self.persist(|| Op::Exchange { name: name.into(), kind: k.name().into(), auto_delete });
+            self.persist(|| Op::Exchange {
+                name: name.into(),
+                kind: k.name().into(),
+                auto_delete,
+            });
         }
         Ok(())
     }
@@ -400,7 +475,9 @@ impl Broker {
                 format!("ACCESS_REFUSED - operation not permitted on the exchange '{name}'"),
             ));
         }
-        let Some(e) = self.exchanges.get(name) else { return Ok(()) };
+        let Some(e) = self.exchanges.get(name) else {
+            return Ok(());
+        };
         if if_unused && !e.bindings.is_empty() {
             return Err(AmqpErr::chan(
                 PRECONDITION_FAILED,
@@ -448,13 +525,27 @@ impl Broker {
             ));
         }
         let dest_durable = match &dest {
-            Dest::Queue(q) => self.queues.get(q).is_some_and(|q| q.durable && q.exclusive.is_none()),
+            Dest::Queue(q) => self
+                .queues
+                .get(q)
+                .is_some_and(|q| q.durable && q.exclusive.is_none()),
             Dest::Exchange(x) => self.exchanges.get(x).is_some_and(|x| x.durable),
         };
-        let e = self.exchanges.get_mut(source).ok_or_else(|| no_exchange(source))?;
-        let b = Binding { dest, key: key.into(), args };
+        let e = self
+            .exchanges
+            .get_mut(source)
+            .ok_or_else(|| no_exchange(source))?;
+        let b = Binding {
+            dest,
+            key: key.into(),
+            args,
+        };
         let row = (e.durable && dest_durable).then(|| bind_row(source, &b));
-        if !e.bindings.iter().any(|x| x.dest == b.dest && x.key == b.key && x.args == b.args) {
+        if !e
+            .bindings
+            .iter()
+            .any(|x| x.dest == b.dest && x.key == b.key && x.args == b.args)
+        {
             e.bindings.push(b);
         }
         e.had_bindings = true;
@@ -465,10 +556,21 @@ impl Broker {
     }
 
     pub fn unbind(&mut self, dest: Dest, source: &str, key: &str, args: &Table) -> Res<()> {
-        let e = self.exchanges.get_mut(source).ok_or_else(|| no_exchange(source))?;
-        e.bindings.retain(|x| !(x.dest == dest && x.key == key && x.args == *args));
+        let e = self
+            .exchanges
+            .get_mut(source)
+            .ok_or_else(|| no_exchange(source))?;
+        e.bindings
+            .retain(|x| !(x.dest == dest && x.key == key && x.args == *args));
         if e.durable {
-            let row = bind_row(source, &Binding { dest, key: key.into(), args: args.clone() });
+            let row = bind_row(
+                source,
+                &Binding {
+                    dest,
+                    key: key.into(),
+                    args: args.clone(),
+                },
+            );
             self.persist(|| Op::Unbind(row));
         }
         self.gc_exchanges();
@@ -535,7 +637,10 @@ impl Broker {
             },
         );
         if durable && !exclusive {
-            self.persist(|| Op::Queue { name: name.clone(), auto_delete });
+            self.persist(|| Op::Queue {
+                name: name.clone(),
+                auto_delete,
+            });
         }
         Ok((name, 0, 0))
     }
@@ -560,8 +665,16 @@ impl Broker {
         Ok(self.purge_ready(name))
     }
 
-    pub fn delete_queue(&mut self, conn: ConnId, name: &str, if_unused: bool, if_empty: bool) -> Res<u32> {
-        let Some(q) = self.queues.get(name) else { return Ok(0) };
+    pub fn delete_queue(
+        &mut self,
+        conn: ConnId,
+        name: &str,
+        if_unused: bool,
+        if_empty: bool,
+    ) -> Res<u32> {
+        let Some(q) = self.queues.get(name) else {
+            return Ok(0);
+        };
         self.check_queue(conn, name)?;
         if if_unused && !q.consumers.is_empty() {
             return Err(AmqpErr::chan(
@@ -581,16 +694,21 @@ impl Broker {
     }
 
     fn remove_queue(&mut self, name: &str) {
-        let Some(q) = self.queues.remove(name) else { return };
+        let Some(q) = self.queues.remove(name) else {
+            return;
+        };
         if q.durable && q.exclusive.is_none() {
             self.persist(|| Op::DeleteQueue(name.into()));
         }
         for c in q.consumers {
             // consumer_cancel_notify
-            self.send(c.conn, method(c.ch, 60, 30, |w| {
-                w.short(&c.tag);
-                w.u8(1);
-            }));
+            self.send(
+                c.conn,
+                method(c.ch, 60, 30, |w| {
+                    w.short(&c.tag);
+                    w.u8(1);
+                }),
+            );
             if let Some(ch) = self.chans.get_mut(&(c.conn, c.ch)) {
                 ch.consumers.retain(|(t, _)| *t != c.tag);
             }
@@ -611,7 +729,14 @@ impl Broker {
 
     // ---- publishing & routing ---------------------------------------------------
 
-    fn route(&self, ex: &str, rk: &str, hdr: &Table, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    fn route(
+        &self,
+        ex: &str,
+        rk: &str,
+        hdr: &Table,
+        out: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
         if ex.is_empty() {
             if self.queues.contains_key(rk) && !out.iter().any(|q| q == rk) {
                 out.push(rk.to_string());
@@ -621,7 +746,9 @@ impl Broker {
         if !seen.insert(ex.to_string()) {
             return;
         }
-        let Some(e) = self.exchanges.get(ex) else { return };
+        let Some(e) = self.exchanges.get(ex) else {
+            return;
+        };
         for b in &e.bindings {
             let hit = match e.kind {
                 Kind::Direct => b.key == rk,
@@ -643,7 +770,15 @@ impl Broker {
         }
     }
 
-    pub fn publish(&mut self, conn: ConnId, ch: u16, exchange: &str, rk: &str, mandatory: bool, msg: Arc<Msg>) -> Res<()> {
+    pub fn publish(
+        &mut self,
+        conn: ConnId,
+        ch: u16,
+        exchange: &str,
+        rk: &str,
+        mandatory: bool,
+        msg: Arc<Msg>,
+    ) -> Res<()> {
         if !self.exchanges.contains_key(exchange) {
             return Err(no_exchange(exchange));
         }
@@ -657,10 +792,18 @@ impl Broker {
                     self.next_msg += 1;
                     id = self.next_msg;
                 }
-                q.msgs.push_back(Entry { msg: msg.clone(), redelivered: false, id });
+                q.msgs.push_back(Entry {
+                    msg: msg.clone(),
+                    redelivered: false,
+                    id,
+                });
             }
             if id != 0 {
-                self.persist(|| Op::Enqueue { id, queue: qn.clone(), msg: msg.clone() });
+                self.persist(|| Op::Enqueue {
+                    id,
+                    queue: qn.clone(),
+                    msg: msg.clone(),
+                });
             }
             self.dispatch(qn);
         }
@@ -679,10 +822,13 @@ impl Broker {
             if let Some(seq) = c.confirm_seq.as_mut() {
                 let tag = *seq;
                 *seq += 1;
-                self.send(conn, method(ch, 60, 80, |w| {
-                    w.u64(tag);
-                    w.u8(0);
-                }));
+                self.send(
+                    conn,
+                    method(ch, 60, 80, |w| {
+                        w.u64(tag);
+                        w.u8(0);
+                    }),
+                );
             }
         }
         Ok(())
@@ -696,7 +842,15 @@ impl Broker {
 
     // ---- consuming --------------------------------------------------------------
 
-    pub fn consume(&mut self, conn: ConnId, ch: u16, queue: &str, tag: &str, no_ack: bool, exclusive: bool) -> Res<String> {
+    pub fn consume(
+        &mut self,
+        conn: ConnId,
+        ch: u16,
+        queue: &str,
+        tag: &str,
+        no_ack: bool,
+        exclusive: bool,
+    ) -> Res<String> {
         let q = self.check_queue(conn, queue)?;
         if q.consumers.iter().any(|c| c.exclusive) || (exclusive && !q.consumers.is_empty()) {
             return Err(AmqpErr::chan(
@@ -719,16 +873,27 @@ impl Broker {
         chan.consumers.push((tag.clone(), queue.to_string()));
         let q = self.queues.get_mut(queue).unwrap();
         q.ever_consumed = true;
-        q.consumers.push(Consumer { tag: tag.clone(), conn, ch, no_ack, exclusive });
+        q.consumers.push(Consumer {
+            tag: tag.clone(),
+            conn,
+            ch,
+            no_ack,
+            exclusive,
+        });
         Ok(tag)
     }
 
     pub fn cancel(&mut self, conn: ConnId, ch: u16, tag: &str) {
-        let Some(chan) = self.chans.get_mut(&(conn, ch)) else { return };
-        let Some(pos) = chan.consumers.iter().position(|(t, _)| t == tag) else { return };
+        let Some(chan) = self.chans.get_mut(&(conn, ch)) else {
+            return;
+        };
+        let Some(pos) = chan.consumers.iter().position(|(t, _)| t == tag) else {
+            return;
+        };
         let (_, qn) = chan.consumers.remove(pos);
         if let Some(q) = self.queues.get_mut(&qn) {
-            q.consumers.retain(|c| !(c.conn == conn && c.ch == ch && c.tag == tag));
+            q.consumers
+                .retain(|c| !(c.conn == conn && c.ch == ch && c.tag == tag));
         }
         self.maybe_autodelete(&qn);
     }
@@ -749,7 +914,9 @@ impl Broker {
     /// Hand queued messages to eligible consumers, round-robin, honoring prefetch.
     pub fn dispatch(&mut self, qn: &str) {
         loop {
-            let Some(q) = self.queues.get_mut(qn) else { return };
+            let Some(q) = self.queues.get_mut(qn) else {
+                return;
+            };
             let n = q.consumers.len();
             if n == 0 || q.msgs.is_empty() {
                 return;
@@ -833,7 +1000,14 @@ impl Broker {
     }
 
     /// ack (`requeue == None`), or nack/reject with/without requeue.
-    pub fn settle(&mut self, conn: ConnId, ch: u16, tag: u64, multiple: bool, requeue: Option<bool>) -> Res<()> {
+    pub fn settle(
+        &mut self,
+        conn: ConnId,
+        ch: u16,
+        tag: u64,
+        multiple: bool,
+        requeue: Option<bool>,
+    ) -> Res<()> {
         let c = self.chans.get_mut(&(conn, ch)).unwrap();
         let tags: Vec<u64> = if multiple {
             let upto = if tag == 0 { u64::MAX } else { tag };
@@ -877,7 +1051,9 @@ impl Broker {
 
     /// basic.recover: requeue every unacked message on the channel.
     pub fn recover(&mut self, conn: ConnId, ch: u16) {
-        let Some(c) = self.chans.get_mut(&(conn, ch)) else { return };
+        let Some(c) = self.chans.get_mut(&(conn, ch)) else {
+            return;
+        };
         let all = std::mem::take(&mut c.unacked);
         let mut touched = Vec::new();
         for (_, (qn, mut m)) in all.into_iter().rev() {
@@ -1010,6 +1186,8 @@ impl Broker {
 
     /// Admin purge (no connection ownership check). Returns None if the queue is missing.
     pub fn purge_admin(&mut self, name: &str) -> Option<u32> {
-        self.queues.contains_key(name).then(|| self.purge_ready(name))
+        self.queues
+            .contains_key(name)
+            .then(|| self.purge_ready(name))
     }
 }

@@ -28,7 +28,9 @@ pub fn flush(broker: &Shared) {
 /// Accept AMQP connections on `listener` forever.
 pub async fn serve_amqp(listener: TcpListener, broker: Shared, verbose: bool) {
     loop {
-        let Ok((sock, _)) = listener.accept().await else { continue };
+        let Ok((sock, _)) = listener.accept().await else {
+            continue;
+        };
         let b = broker.clone();
         tokio::spawn(async move {
             let _ = conn::serve(sock, b, verbose).await;
@@ -39,7 +41,9 @@ pub async fn serve_amqp(listener: TcpListener, broker: Shared, verbose: bool) {
 /// Serve the management API and web UI on `listener` forever.
 pub async fn serve_http(listener: TcpListener, broker: Shared) {
     loop {
-        let Ok((sock, _)) = listener.accept().await else { continue };
+        let Ok((sock, _)) = listener.accept().await else {
+            continue;
+        };
         let b = broker.clone();
         tokio::spawn(async move {
             let _ = http::serve(sock, b).await;

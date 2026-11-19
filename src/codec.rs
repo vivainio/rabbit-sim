@@ -54,10 +54,18 @@ pub struct AmqpErr {
 
 impl AmqpErr {
     pub fn chan(code: u16, text: impl Into<String>) -> Self {
-        AmqpErr { code, text: text.into(), hard: false }
+        AmqpErr {
+            code,
+            text: text.into(),
+            hard: false,
+        }
     }
     pub fn conn(code: u16, text: impl Into<String>) -> Self {
-        AmqpErr { code, text: text.into(), hard: true }
+        AmqpErr {
+            code,
+            text: text.into(),
+            hard: true,
+        }
     }
 }
 
@@ -353,7 +361,11 @@ pub fn props_parse(props: &[u8]) -> Res<(Table, u8)> {
     if flags & 0x4000 != 0 {
         r.short()?;
     }
-    let headers = if flags & 0x2000 != 0 { r.table()? } else { Vec::new() };
+    let headers = if flags & 0x2000 != 0 {
+        r.table()?
+    } else {
+        Vec::new()
+    };
     let mode = if flags & 0x1000 != 0 { r.u8()? } else { 1 };
     Ok((headers, mode))
 }
