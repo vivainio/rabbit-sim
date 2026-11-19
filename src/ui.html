@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RabbitSim</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font:14px/1.4 system-ui,sans-serif;margin:0;padding:16px 24px;background:#fafafa;color:#222}
+  h1{font-size:18px;margin:0 0 12px}h2{font-size:13px;margin:22px 0 6px;text-transform:uppercase;letter-spacing:.05em;color:#666}
+  .cards{display:flex;gap:10px;flex-wrap:wrap}
+  .card{background:#fff;border:1px solid #ddd;border-radius:6px;padding:8px 14px;min-width:90px}
+  .card b{display:block;font-size:20px}.card span{color:#666;font-size:12px}
+  table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
+  th,td{text-align:left;padding:5px 10px;border-bottom:1px solid #eee}th{background:#f3f3f3;font-weight:600}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  button{font:inherit;cursor:pointer}.empty{color:#999;padding:8px 10px}
+  h1 small{font-weight:normal;font-size:12px;color:#666;margin-left:8px}
+  #err{color:#b00;margin-left:12px;font-weight:normal;font-size:12px}
+  @media (prefers-color-scheme:dark){body{background:#181818;color:#ddd}.card,table{background:#222;border-color:#333}th{background:#2a2a2a}th,td{border-color:#333}}
+</style>
+<h1>RabbitSim <small id="storage"></small><span id="err"></span></h1>
+<div class="cards" id="cards"></div>
+<h2>Queues</h2><div id="queues"></div>
+<h2>Exchanges</h2><div id="exchanges"></div>
+<h2>Bindings</h2><div id="bindings"></div>
+<h2>Connections</h2><div id="connections"></div>
+<script>
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const get = p => fetch('/api/' + p).then(r => r.json());
+function table(el, cols, rows, extra) {
+  const t = document.getElementById(el);
+  if (!rows.length) { t.innerHTML = '<div class="empty">none</div>'; return; }
+  t.innerHTML = '<table><tr>' + cols.map(c => `<th class="${c[2]||''}">${c[1]}</th>`).join('') + (extra ? '<th></th>' : '') + '</tr>' +
+    rows.map(r => '<tr>' + cols.map(c => `<td class="${c[2]||''}">${esc(r[c[0]] === '' ? '(default)' : r[c[0]])}</td>`).join('') + (extra ? `<td>${extra(r)}</td>` : '') + '</tr>').join('') + '</table>';
+}
+async function purge(name) {
+  if (!confirm('Purge all ready messages from "' + name + '"?')) return;
+  await fetch('/api/queues/%2F/' + encodeURIComponent(name) + '/contents', {method: 'DELETE'});
+  refresh();
+}
+async function refresh() {
+  try {
+    const [o, q, e, b, c] = await Promise.all(['overview','queues','exchanges','bindings','connections'].map(get));
+    document.getElementById('err').textContent = '';
+    document.getElementById('storage').textContent = o.storage ? 'persisted: ' + o.storage : 'in-memory';
+    document.getElementById('cards').innerHTML = [['connections','Connections'],['channels','Channels'],['queues','Queues'],['exchanges','Exchanges'],['consumers','Consumers'],['messages_ready','Ready'],['messages_unacknowledged','Unacked']]
+      .map(([k, l]) => `<div class="card"><b>${o[k]}</b><span>${l}</span></div>`).join('');
+    table('queues', [['name','Name'],['messages_ready','Ready','n'],['messages_unacknowledged','Unacked','n'],['consumers','Consumers','n'],['durable','Durable'],['auto_delete','Auto-delete'],['exclusive','Exclusive']], q,
+      r => `<button data-q="${esc(r.name)}">purge</button>`);
+    document.querySelectorAll('button[data-q]').forEach(b => b.onclick = () => purge(b.dataset.q));
+    table('exchanges', [['name','Name'],['type','Type'],['durable','Durable'],['auto_delete','Auto-delete'],['bindings','Bindings','n']], e);
+    table('bindings', [['source','Source'],['destination_type','To'],['destination','Destination'],['routing_key','Routing key']], b);
+    table('connections', [['id','#','n'],['peer','Peer'],['channels','Channels','n'],['frame_max','Frame max','n']], c);
+  } catch (x) { document.getElementById('err').textContent = 'disconnected'; }
+}
+refresh(); setInterval(refresh, 2000);
+</script>

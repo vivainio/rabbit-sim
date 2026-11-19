@@ -1,0 +1,17 @@
+[package]
+name = "rabbitsim"
+version = "0.1.0"
+edition = "2021"
+description = "Single-binary, in-memory AMQP 0-9-1 broker for local development"
+
+[dependencies]
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+
+[dev-dependencies]
+lapin = "2"
+futures-lite = "2"
+
+[profile.release]
+lto = true
+strip = true
