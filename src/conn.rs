@@ -46,6 +46,7 @@ struct Pending {
     props: Option<Vec<u8>>,
     headers: Table,
     persistent: bool,
+    ttl_ms: Option<u64>,
     size: u64,
     body: Vec<u8>,
 }
@@ -271,9 +272,10 @@ impl Conn {
                 let _weight = r.u16()?;
                 p.size = r.u64()?;
                 let props = r.rest().to_vec();
-                let (headers, mode) = props_parse(&props)?;
-                p.headers = headers;
-                p.persistent = mode == 2;
+                let parsed = parse_props(&props)?;
+                p.headers = parsed.headers.unwrap_or_default();
+                p.persistent = parsed.delivery_mode == Some(2);
+                p.ttl_ms = parsed.expiration.as_deref().and_then(|e| e.parse().ok());
                 p.props = Some(props);
                 if p.size == 0 {
                     self.finish_publish(f.ch)?;
@@ -328,6 +330,7 @@ impl Conn {
             props: p.props.unwrap_or_default(),
             body: p.body,
             persistent: p.persistent,
+            ttl_ms: p.ttl_ms,
         });
         self.broker
             .lock()
@@ -480,6 +483,7 @@ impl Conn {
                 r.u16()?;
                 let name = r.short()?;
                 let bits = r.u8()?;
+                let args = r.table()?;
                 let (name, msgs, cons) = self.broker.lock().unwrap().declare_queue(
                     self.id,
                     &name,
@@ -487,6 +491,7 @@ impl Conn {
                     bits & 2 != 0,
                     bits & 4 != 0,
                     bits & 8 != 0,
+                    args,
                 )?;
                 self.last_queue = name.clone();
                 if bits & 16 == 0 {
@@ -582,6 +587,7 @@ impl Conn {
                     props: None,
                     headers: Vec::new(),
                     persistent: false,
+                    ttl_ms: None,
                     size: 0,
                     body: Vec::new(),
                 });

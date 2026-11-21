@@ -335,37 +335,99 @@ pub fn content(ch: u16, props: &[u8], body: &[u8], frame_max: usize) -> Vec<u8> 
     out
 }
 
-/// Extract the `headers` table from raw basic properties (flags + values).
-pub fn props_headers(props: &[u8]) -> Res<Table> {
-    let mut r = R::new(props);
-    let flags = r.u16()?;
-    if flags & 0x8000 != 0 {
-        r.short()?;
-    }
-    if flags & 0x4000 != 0 {
-        r.short()?;
-    }
-    if flags & 0x2000 != 0 {
-        return r.table();
-    }
-    Ok(Vec::new())
+/// Decoded basic properties. Re-encode with [`Props::encode`] after modifying.
+#[derive(Debug, Default, Clone)]
+pub struct Props {
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub headers: Option<Table>,
+    pub delivery_mode: Option<u8>,
+    pub priority: Option<u8>,
+    pub correlation_id: Option<String>,
+    pub reply_to: Option<String>,
+    pub expiration: Option<String>,
+    pub message_id: Option<String>,
+    pub timestamp: Option<u64>,
+    pub kind: Option<String>,
+    pub user_id: Option<String>,
+    pub app_id: Option<String>,
+    pub cluster_id: Option<String>,
 }
 
-/// Parse headers table and delivery-mode out of raw basic properties.
-pub fn props_parse(props: &[u8]) -> Res<(Table, u8)> {
-    let mut r = R::new(props);
-    let flags = r.u16()?;
-    if flags & 0x8000 != 0 {
-        r.short()?;
-    }
-    if flags & 0x4000 != 0 {
-        r.short()?;
-    }
-    let headers = if flags & 0x2000 != 0 {
-        r.table()?
-    } else {
-        Vec::new()
+pub fn parse_props(b: &[u8]) -> Res<Props> {
+    let mut r = R::new(b);
+    let f = r.u16()?;
+    let mut p = Props::default();
+    let short = |bit: u16, r: &mut R| -> Res<Option<String>> {
+        if f & bit != 0 {
+            Ok(Some(r.short()?))
+        } else {
+            Ok(None)
+        }
     };
-    let mode = if flags & 0x1000 != 0 { r.u8()? } else { 1 };
-    Ok((headers, mode))
+    p.content_type = short(0x8000, &mut r)?;
+    p.content_encoding = short(0x4000, &mut r)?;
+    if f & 0x2000 != 0 {
+        p.headers = Some(r.table()?);
+    }
+    if f & 0x1000 != 0 {
+        p.delivery_mode = Some(r.u8()?);
+    }
+    if f & 0x0800 != 0 {
+        p.priority = Some(r.u8()?);
+    }
+    p.correlation_id = short(0x0400, &mut r)?;
+    p.reply_to = short(0x0200, &mut r)?;
+    p.expiration = short(0x0100, &mut r)?;
+    p.message_id = short(0x0080, &mut r)?;
+    if f & 0x0040 != 0 {
+        p.timestamp = Some(r.u64()?);
+    }
+    p.kind = short(0x0020, &mut r)?;
+    p.user_id = short(0x0010, &mut r)?;
+    p.app_id = short(0x0008, &mut r)?;
+    p.cluster_id = short(0x0004, &mut r)?;
+    Ok(p)
+}
+
+impl Props {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut flags = 0u16;
+        let mut w = W::default();
+        w.u16(0);
+        fn short(flags: &mut u16, bit: u16, v: &Option<String>, w: &mut W) {
+            if let Some(s) = v {
+                *flags |= bit;
+                w.short(s);
+            }
+        }
+        short(&mut flags, 0x8000, &self.content_type, &mut w);
+        short(&mut flags, 0x4000, &self.content_encoding, &mut w);
+        if let Some(h) = &self.headers {
+            flags |= 0x2000;
+            w.table(h);
+        }
+        if let Some(v) = self.delivery_mode {
+            flags |= 0x1000;
+            w.u8(v);
+        }
+        if let Some(v) = self.priority {
+            flags |= 0x0800;
+            w.u8(v);
+        }
+        short(&mut flags, 0x0400, &self.correlation_id, &mut w);
+        short(&mut flags, 0x0200, &self.reply_to, &mut w);
+        short(&mut flags, 0x0100, &self.expiration, &mut w);
+        short(&mut flags, 0x0080, &self.message_id, &mut w);
+        if let Some(v) = self.timestamp {
+            flags |= 0x0040;
+            w.u64(v);
+        }
+        short(&mut flags, 0x0020, &self.kind, &mut w);
+        short(&mut flags, 0x0010, &self.user_id, &mut w);
+        short(&mut flags, 0x0008, &self.app_id, &mut w);
+        short(&mut flags, 0x0004, &self.cluster_id, &mut w);
+        w.0[0..2].copy_from_slice(&flags.to_be_bytes());
+        w.0
+    }
 }

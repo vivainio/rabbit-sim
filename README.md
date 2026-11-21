@@ -35,6 +35,16 @@ Any username and password are accepted, and all clients share one vhost.
   round-robin dispatch, redelivery when a channel or connection closes
 - Heartbeats, consumer cancel notification, RabbitMQ-style channel/connection error codes and texts
 
+### Queue arguments
+| Argument | Behaviour |
+| --- | --- |
+| `x-dead-letter-exchange`, `x-dead-letter-routing-key` | messages that are rejected/nacked without requeue, expire, overflow or hit the delivery limit are republished there with RabbitMQ's `x-death` and `x-first-death-*` headers (`expiration` is dropped; cycles are broken the way RabbitMQ does) |
+| `x-message-ttl`, per-message `expiration` | expired messages are dead-lettered or dropped; like RabbitMQ, only the head of a queue expires |
+| `x-max-length`, `x-overflow` | `drop-head` (default, dead-letters the oldest), `reject-publish` (publisher confirm becomes a nack), `reject-publish-dlx` |
+| `x-queue-type=quorum`, `x-delivery-limit` | quorum rules (durable, non-exclusive, no auto-delete) and delivery counting: redelivered messages carry `x-delivery-count`, and a message returned more than the limit (default 20, as in RabbitMQ 4.x) is dead-lettered with reason `delivery_limit`. Classic queues don't count. |
+
+Redeclaring a queue with different arguments fails with `PRECONDITION_FAILED - inequivalent arg ...`, as in RabbitMQ.
+
 Tested with the Rust `lapin` client (the test suite) and the .NET `RabbitMQ.Client` 6.x, including a broker kill and restart.
 
 ## Persistence (optional)
@@ -53,11 +63,20 @@ milliseconds of writes.
     GET    /api/{overview,queues,exchanges,bindings,connections}
     DELETE /api/queues/%2F/{name}/contents        # purge ready messages
 
+### Fault injection (`/chaos/*`)
+Time-dependent behaviour is slow to test, so the broker's TTL clock can be driven over HTTP:
+
+    POST /chaos/clock/advance?ms=3600000          # move the TTL clock forward and expire what is due
+    POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now
+
+Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock;
+heartbeats and everything else run on real time.
+
 ## Not supported
 - Clustering, replication, TLS, real authentication, multiple vhosts, a drop-in RabbitMQ management API
 - Transactions (`tx.*` returns NOT_IMPLEMENTED)
-- Queue arguments such as `x-message-ttl`, `x-max-length` and `x-dead-letter-exchange` are accepted but ignored;
-  priority queues, quorum queues and streams are not implemented
+- Other queue arguments (`x-expires`, `x-max-priority`, `x-max-length-bytes`, `x-single-active-consumer`, ...)
+  are accepted but ignored; quorum queues only emulate delivery counting/limits, and streams are rejected
 - `basic.qos` limits apply per channel whether or not the client sets the global flag
 
 ## Development

@@ -14,7 +14,7 @@ const SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS exchanges(name TEXT PRIMARY KEY, kind TEXT NOT NULL, auto_delete INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS queues(name TEXT PRIMARY KEY, auto_delete INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS queues(name TEXT PRIMARY KEY, auto_delete INTEGER NOT NULL, args BLOB);
 CREATE TABLE IF NOT EXISTS bindings(
     source TEXT NOT NULL, dest TEXT NOT NULL, dest_is_queue INTEGER NOT NULL,
     key TEXT NOT NULL, args BLOB NOT NULL,
@@ -43,6 +43,7 @@ pub enum Op {
     Queue {
         name: String,
         auto_delete: bool,
+        args: Vec<u8>,
     },
     DeleteQueue(String),
     Bind(BindRow),
@@ -68,7 +69,7 @@ pub struct StoredMsg {
 #[derive(Default)]
 pub struct Loaded {
     pub exchanges: Vec<(String, String, bool)>,
-    pub queues: Vec<(String, bool)>,
+    pub queues: Vec<(String, bool, Vec<u8>)>,
     pub bindings: Vec<BindRow>,
     pub messages: Vec<StoredMsg>,
 }
@@ -96,6 +97,20 @@ impl Store {
     pub fn open(path: &str) -> Result<(Store, Loaded), String> {
         let db = Connection::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
         db.execute_batch(SCHEMA).map_err(err)?;
+        // databases created by 0.1.x have no `args` column on queues
+        let has_args = db
+            .prepare("PRAGMA table_info(queues)")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(err)?
+            .iter()
+            .any(|n| n == "args");
+        if !has_args {
+            db.execute("ALTER TABLE queues ADD COLUMN args BLOB", [])
+                .map_err(err)?;
+        }
         let loaded = load(&db).map_err(err)?;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -124,8 +139,14 @@ fn load(db: &Connection) -> rusqlite::Result<Loaded> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))?
         .collect::<Result<_, _>>()?;
     let queues = db
-        .prepare("SELECT name, auto_delete FROM queues")?
-        .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?
+        .prepare("SELECT name, auto_delete, args FROM queues")?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+            ))
+        })?
         .collect::<Result<_, _>>()?;
     let bindings = db
         .prepare("SELECT source, dest, dest_is_queue, key, args FROM bindings")?
@@ -221,9 +242,15 @@ fn apply(tx: &Transaction, op: Op) -> rusqlite::Result<()> {
             )?
             .execute([&name])?;
         }
-        Op::Queue { name, auto_delete } => {
-            tx.prepare_cached("INSERT OR REPLACE INTO queues(name, auto_delete) VALUES(?1, ?2)")?
-                .execute(params![name, auto_delete])?;
+        Op::Queue {
+            name,
+            auto_delete,
+            args,
+        } => {
+            tx.prepare_cached(
+                "INSERT OR REPLACE INTO queues(name, auto_delete, args) VALUES(?1, ?2, ?3)",
+            )?
+            .execute(params![name, auto_delete, args])?;
         }
         Op::DeleteQueue(name) => {
             tx.prepare_cached("DELETE FROM queues WHERE name = ?1")?

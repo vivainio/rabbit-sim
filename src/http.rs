@@ -41,8 +41,14 @@ fn json(body: &str) -> Vec<u8> {
 }
 
 fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
-    let path = path.split('?').next().unwrap_or("");
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let path = path.trim_end_matches('/');
+    let param = |k: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+            .map(percent_decode)
+    };
     match (method, path) {
         ("GET", "") | ("GET", "/index.html") => respond("200 OK", "text/html; charset=utf-8", UI),
         ("GET", "/api/overview") => json(&broker.lock().unwrap().json_overview()),
@@ -56,6 +62,31 @@ fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
             let name = percent_decode(mid.split_once('/').map_or(mid, |(_, n)| n));
             match broker.lock().unwrap().purge_admin(&name) {
                 Some(n) => json(&format!("{{\"purged\":{n}}}")),
+                None => respond(
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"no such queue\"}",
+                ),
+            }
+        }
+        // POST /chaos/clock/advance?ms=N -> move the TTL clock forward by N ms
+        ("POST", "/chaos/clock/advance") => match param("ms").and_then(|v| v.parse::<u64>().ok()) {
+            Some(ms) => {
+                broker.lock().unwrap().advance_clock(ms);
+                json(&format!("{{\"advanced_ms\":{ms}}}"))
+            }
+            None => respond(
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"expected ?ms=<milliseconds>\"}",
+            ),
+        },
+        // POST /chaos/queues/{vhost}/{name}/expire -> expire all ready messages now
+        ("POST", p) if p.starts_with("/chaos/queues/") && p.ends_with("/expire") => {
+            let mid = &p["/chaos/queues/".len()..p.len() - "/expire".len()];
+            let name = percent_decode(mid.split_once('/').map_or(mid, |(_, n)| n));
+            match broker.lock().unwrap().expire_all(&name) {
+                Some(n) => json(&format!("{{\"expired\":{n}}}")),
                 None => respond(
                     "404 Not Found",
                     "application/json",

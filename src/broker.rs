@@ -2,8 +2,10 @@
 
 use crate::codec::*;
 use crate::store::{decode_args, encode_args, BindRow, Op, Store};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub type ConnId = u64;
@@ -18,6 +20,8 @@ pub struct Msg {
     pub body: Vec<u8>,
     /// delivery_mode == 2
     pub persistent: bool,
+    /// per-message TTL from the `expiration` property
+    pub ttl_ms: Option<u64>,
 }
 
 /// A message sitting in a queue (or unacked on a channel).
@@ -26,6 +30,166 @@ pub struct Entry {
     redelivered: bool,
     /// Row id in the store, 0 if not persisted.
     id: i64,
+    /// Times returned to the queue (only counted on quorum queues).
+    delivery_count: u32,
+    expires_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub enum Overflow {
+    #[default]
+    DropHead,
+    RejectPublish,
+    RejectPublishDlx,
+}
+
+/// Behaviour derived from queue arguments (`x-*`).
+#[derive(Clone, Default)]
+pub struct QueueCfg {
+    dlx: Option<String>,
+    dlrk: Option<String>,
+    ttl_ms: Option<u64>,
+    max_length: Option<usize>,
+    overflow: Overflow,
+    quorum: bool,
+    delivery_limit: Option<u32>,
+}
+
+fn int_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::I8(x) => Some(*x as i64),
+        Value::U8(x) => Some(*x as i64),
+        Value::I16(x) => Some(*x as i64),
+        Value::U16(x) => Some(*x as i64),
+        Value::I32(x) => Some(*x as i64),
+        Value::U32(x) => Some(*x as i64),
+        Value::I64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+fn str_of(v: &Value) -> Option<String> {
+    match v {
+        Value::Str(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }
+}
+
+fn bad_arg(name: &str, key: &str) -> AmqpErr {
+    AmqpErr::chan(
+        PRECONDITION_FAILED,
+        format!("PRECONDITION_FAILED - invalid arg '{key}' for queue '{name}' in vhost '/'"),
+    )
+}
+
+fn parse_cfg(name: &str, args: &Table) -> Res<QueueCfg> {
+    let mut c = QueueCfg::default();
+    let mut limit = None;
+    for (k, v) in args {
+        let bad = || bad_arg(name, k);
+        match k.as_str() {
+            "x-dead-letter-exchange" => c.dlx = Some(str_of(v).ok_or_else(bad)?),
+            "x-dead-letter-routing-key" => c.dlrk = Some(str_of(v).ok_or_else(bad)?),
+            "x-message-ttl" => {
+                c.ttl_ms = Some(int_of(v).filter(|n| *n >= 0).ok_or_else(bad)? as u64)
+            }
+            "x-max-length" => {
+                c.max_length = Some(int_of(v).filter(|n| *n >= 0).ok_or_else(bad)? as usize)
+            }
+            "x-overflow" => {
+                c.overflow = match str_of(v).as_deref() {
+                    Some("drop-head") => Overflow::DropHead,
+                    Some("reject-publish") => Overflow::RejectPublish,
+                    Some("reject-publish-dlx") => Overflow::RejectPublishDlx,
+                    _ => return Err(bad()),
+                }
+            }
+            "x-queue-type" => match str_of(v).as_deref() {
+                Some("classic") => {}
+                Some("quorum") => c.quorum = true,
+                _ => return Err(bad()),
+            },
+            "x-delivery-limit" => limit = Some(int_of(v).ok_or_else(bad)?),
+            _ => {}
+        }
+    }
+    if c.quorum {
+        // quorum queues in RabbitMQ 4.x default to a delivery limit of 20
+        c.delivery_limit = match limit {
+            Some(n) if n < 0 => None,
+            Some(n) => Some(n.min(u32::MAX as i64) as u32),
+            None => Some(20),
+        };
+    }
+    Ok(c)
+}
+
+fn fmt_val(v: Option<&Value>) -> String {
+    match v {
+        None => "none".into(),
+        Some(x) => int_of(x)
+            .map(|n| n.to_string())
+            .or_else(|| str_of(x))
+            .unwrap_or_else(|| format!("{x:?}")),
+    }
+}
+
+/// First argument key whose value differs between two tables.
+fn args_diff<'a>(
+    a: &'a Table,
+    b: &'a Table,
+) -> Option<(String, Option<&'a Value>, Option<&'a Value>)> {
+    fn get<'a>(t: &'a Table, k: &str) -> Option<&'a Value> {
+        t.iter().find(|(n, _)| n == k).map(|(_, v)| v)
+    }
+    for (k, _) in a.iter().chain(b.iter()) {
+        let (x, y) = (get(a, k), get(b, k));
+        let same = match (x, y) {
+            (None, None) => true,
+            (Some(p), Some(q)) => match (int_of(p), int_of(q)) {
+                (Some(m), Some(n)) => m == n,
+                _ => p == q,
+            },
+            _ => false,
+        };
+        if !same {
+            return Some((k.clone(), x, y));
+        }
+    }
+    None
+}
+
+fn group_by_queue(items: Vec<(String, Entry)>) -> Vec<(String, Vec<Entry>)> {
+    let mut out: Vec<(String, Vec<Entry>)> = Vec::new();
+    for (qn, e) in items {
+        match out.iter_mut().find(|(n, _)| *n == qn) {
+            Some((_, v)) => v.push(e),
+            None => out.push((qn, vec![e])),
+        }
+    }
+    out
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Properties to send with a delivery: adds `x-delivery-count` once a message was returned.
+fn out_props(msg: &Msg, count: u32) -> Cow<'_, [u8]> {
+    if count == 0 {
+        return Cow::Borrowed(&msg.props);
+    }
+    match parse_props(&msg.props) {
+        Ok(mut p) => {
+            let h = p.headers.get_or_insert_with(Vec::new);
+            h.retain(|(k, _)| k != "x-delivery-count");
+            h.push(("x-delivery-count".into(), Value::I64(count as i64)));
+            Cow::Owned(p.encode())
+        }
+        Err(_) => Cow::Borrowed(&msg.props),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -93,6 +257,8 @@ pub struct Queue {
     consumers: Vec<Consumer>,
     rr: usize,
     ever_consumed: bool,
+    args: Table,
+    cfg: QueueCfg,
 }
 
 struct ConnInfo {
@@ -121,6 +287,8 @@ pub struct Broker {
     store: Option<Store>,
     storage: Option<String>,
     next_msg: i64,
+    /// Added to the real clock for message TTLs; moved forward via the chaos API.
+    clock_skew: Duration,
 }
 
 fn esc(s: &str) -> String {
@@ -239,7 +407,9 @@ impl Broker {
                 );
             }
         }
-        for (name, auto_delete) in l.queues {
+        for (name, auto_delete, blob) in l.queues {
+            let args = decode_args(&blob);
+            let cfg = parse_cfg(&name, &args).unwrap_or_default();
             b.queues.insert(
                 name,
                 Queue {
@@ -250,6 +420,8 @@ impl Broker {
                     consumers: vec![],
                     rr: 0,
                     ever_consumed: false,
+                    args,
+                    cfg,
                 },
             );
         }
@@ -277,19 +449,27 @@ impl Broker {
             let Some(q) = b.queues.get_mut(&m.queue) else {
                 continue;
             };
-            let headers = props_headers(&m.props).unwrap_or_default();
+            let parsed = parse_props(&m.props).unwrap_or_default();
+            let ttl_ms = parsed.expiration.as_deref().and_then(|e| e.parse().ok());
+            let ttl = match (q.cfg.ttl_ms, ttl_ms) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let msg = Arc::new(Msg {
                 exchange: m.exchange,
                 routing_key: m.routing_key,
-                headers,
+                headers: parsed.headers.unwrap_or_default(),
                 props: m.props,
                 body: m.body,
                 persistent: true,
+                ttl_ms,
             });
             q.msgs.push_back(Entry {
                 msg,
                 redelivered: false,
                 id: m.id,
+                delivery_count: 0,
+                expires_at: ttl.map(|t| Instant::now() + Duration::from_millis(t)),
             });
         }
         b.store = Some(store);
@@ -356,21 +536,10 @@ impl Broker {
             }
             self.maybe_autodelete(qn);
         }
-        let mut by_q: Vec<(String, Vec<Entry>)> = Vec::new();
-        for (_, (qn, m)) in c.unacked {
-            match by_q.iter_mut().find(|(n, _)| *n == qn) {
-                Some((_, v)) => v.push(m),
-                None => by_q.push((qn, vec![m])),
-            }
-        }
-        for (qn, msgs) in by_q {
-            if let Some(q) = self.queues.get_mut(&qn) {
-                for mut e in msgs.into_iter().rev() {
-                    e.redelivered = true;
-                    q.msgs.push_front(e);
-                }
-                self.dispatch(&qn);
-            }
+        let entries: Vec<(String, Entry)> = c.unacked.into_values().collect();
+        for (qn, msgs) in group_by_queue(entries) {
+            self.requeue(&qn, msgs);
+            self.dispatch(&qn);
         }
     }
 
@@ -590,6 +759,7 @@ impl Broker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn declare_queue(
         &mut self,
         conn: ConnId,
@@ -598,6 +768,7 @@ impl Broker {
         durable: bool,
         exclusive: bool,
         auto_delete: bool,
+        args: Table,
     ) -> Res<(String, u32, u32)> {
         let name = if name.is_empty() {
             let n = self.next_id();
@@ -613,6 +784,18 @@ impl Broker {
                     format!("PRECONDITION_FAILED - inequivalent arg 'durable/auto_delete' for queue '{name}' in vhost '/'"),
                 ));
             }
+            if !passive {
+                if let Some((k, got, cur)) = args_diff(&args, &q.args) {
+                    return Err(AmqpErr::chan(
+                        PRECONDITION_FAILED,
+                        format!(
+                            "PRECONDITION_FAILED - inequivalent arg '{k}' for queue '{name}' in vhost '/': received '{}' but current is '{}'",
+                            fmt_val(got),
+                            fmt_val(cur)
+                        ),
+                    ));
+                }
+            }
             return Ok((name.clone(), q.msgs.len() as u32, q.consumers.len() as u32));
         }
         if passive {
@@ -624,6 +807,31 @@ impl Broker {
                 format!("ACCESS_REFUSED - queue name '{name}' contains reserved prefix 'amq.*'"),
             ));
         }
+        let cfg = parse_cfg(&name, &args)?;
+        if cfg.quorum {
+            let bad = if !durable {
+                Some("non-durable")
+            } else if exclusive {
+                Some("exclusive")
+            } else if auto_delete {
+                Some("auto-delete")
+            } else {
+                None
+            };
+            if let Some(prop) = bad {
+                return Err(AmqpErr::chan(
+                    PRECONDITION_FAILED,
+                    format!("PRECONDITION_FAILED - invalid property '{prop}' for queue '{name}' in vhost '/'"),
+                ));
+            }
+        }
+        if durable && !exclusive {
+            self.persist(|| Op::Queue {
+                name: name.clone(),
+                auto_delete,
+                args: encode_args(&args),
+            });
+        }
         self.queues.insert(
             name.clone(),
             Queue {
@@ -634,14 +842,10 @@ impl Broker {
                 consumers: vec![],
                 rr: 0,
                 ever_consumed: false,
+                args,
+                cfg,
             },
         );
-        if durable && !exclusive {
-            self.persist(|| Op::Queue {
-                name: name.clone(),
-                auto_delete,
-            });
-        }
         Ok((name, 0, 0))
     }
 
@@ -784,26 +988,10 @@ impl Broker {
         }
         let mut qs = Vec::new();
         self.route(exchange, rk, &msg.headers, &mut qs, &mut HashSet::new());
-        let persist = msg.persistent && self.store.is_some();
+        let mut rejected = false;
         for qn in &qs {
-            let mut id = 0;
-            if let Some(q) = self.queues.get_mut(qn) {
-                if persist && q.durable && q.exclusive.is_none() {
-                    self.next_msg += 1;
-                    id = self.next_msg;
-                }
-                q.msgs.push_back(Entry {
-                    msg: msg.clone(),
-                    redelivered: false,
-                    id,
-                });
-            }
-            if id != 0 {
-                self.persist(|| Op::Enqueue {
-                    id,
-                    queue: qn.clone(),
-                    msg: msg.clone(),
-                });
+            if !self.enqueue(qn, &msg) {
+                rejected = true;
             }
             self.dispatch(qn);
         }
@@ -822,9 +1010,11 @@ impl Broker {
             if let Some(seq) = c.confirm_seq.as_mut() {
                 let tag = *seq;
                 *seq += 1;
+                // basic.nack when a queue rejected the publish (x-overflow=reject-publish), else basic.ack
+                let id = if rejected { 120 } else { 80 };
                 self.send(
                     conn,
-                    method(ch, 60, 80, |w| {
+                    method(ch, 60, id, |w| {
                         w.u64(tag);
                         w.u8(0);
                     }),
@@ -913,6 +1103,11 @@ impl Broker {
 
     /// Hand queued messages to eligible consumers, round-robin, honoring prefetch.
     pub fn dispatch(&mut self, qn: &str) {
+        self.dispatch_inner(qn);
+        self.expire_head(qn);
+    }
+
+    fn dispatch_inner(&mut self, qn: &str) {
         loop {
             let Some(q) = self.queues.get_mut(qn) else {
                 return;
@@ -937,7 +1132,8 @@ impl Broker {
             let Some(idx) = pick else { return };
             q.rr = (idx + 1) % n;
             let entry = q.msgs.pop_front().unwrap();
-            let (msg, redelivered) = (entry.msg.clone(), entry.redelivered);
+            let (msg, redelivered, count) =
+                (entry.msg.clone(), entry.redelivered, entry.delivery_count);
             let c = &q.consumers[idx];
             let (conn, ch, tag, no_ack) = (c.conn, c.ch, c.tag.clone(), c.no_ack);
             let chan = self.chans.get_mut(&(conn, ch)).unwrap();
@@ -960,19 +1156,21 @@ impl Broker {
                 w.short(&msg.exchange);
                 w.short(&msg.routing_key);
             });
-            b.extend(content(ch, &msg.props, &msg.body, frame_max));
+            b.extend(content(ch, &out_props(&msg, count), &msg.body, frame_max));
             self.send(conn, b);
         }
     }
 
     pub fn get(&mut self, conn: ConnId, ch: u16, queue: &str, no_ack: bool) -> Res<()> {
         self.check_queue(conn, queue)?;
+        self.expire_head(queue);
         let q = self.queues.get_mut(queue).unwrap();
         let Some(entry) = q.msgs.pop_front() else {
             self.send(conn, method(ch, 60, 72, |w| w.short("")));
             return Ok(());
         };
-        let (msg, redelivered) = (entry.msg.clone(), entry.redelivered);
+        let (msg, redelivered, count) =
+            (entry.msg.clone(), entry.redelivered, entry.delivery_count);
         let remaining = q.msgs.len() as u32;
         let chan = self.chans.get_mut(&(conn, ch)).unwrap();
         let dtag = chan.next_tag;
@@ -994,7 +1192,7 @@ impl Broker {
             w.short(&msg.routing_key);
             w.u32(remaining);
         });
-        b.extend(content(ch, &msg.props, &msg.body, frame_max));
+        b.extend(content(ch, &out_props(&msg, count), &msg.body, frame_max));
         self.send(conn, b);
         Ok(())
     }
@@ -1023,6 +1221,7 @@ impl Broker {
         let mut touched: Vec<String> = Vec::new();
         let mut back: Vec<(String, Entry)> = Vec::new();
         let mut gone: Vec<i64> = Vec::new();
+        let mut dead: Vec<(String, Arc<Msg>)> = Vec::new();
         for t in tags {
             let (qn, m) = c.unacked.remove(&t).unwrap();
             if !touched.contains(&qn) {
@@ -1030,20 +1229,36 @@ impl Broker {
             }
             if requeue == Some(true) {
                 back.push((qn, m));
-            } else if m.id != 0 {
-                gone.push(m.id);
+            } else {
+                if m.id != 0 {
+                    gone.push(m.id);
+                }
+                if requeue == Some(false) {
+                    dead.push((qn, m.msg.clone()));
+                }
             }
         }
         if !gone.is_empty() {
             self.persist(|| Op::Remove(gone));
         }
-        for (qn, mut e) in back.into_iter().rev() {
-            if let Some(q) = self.queues.get_mut(&qn) {
-                e.redelivered = true;
-                q.msgs.push_front(e);
-            }
+        for (qn, msgs) in group_by_queue(back) {
+            self.requeue(&qn, msgs);
         }
+        for (qn, msg) in dead {
+            self.dead_letter(&qn, msg, "rejected");
+        }
+        // An ack frees a prefetch slot for the whole channel, so queues the channel consumes from but did not just
+        // settle may now be able to deliver too. Without this, a message waiting on a second queue stays stuck.
+        let mut waiting: Vec<String> = self
+            .chans
+            .get(&(conn, ch))
+            .map(|c| c.consumers.iter().map(|(_, q)| q.clone()).collect())
+            .unwrap_or_default();
         for qn in touched {
+            waiting.retain(|q| *q != qn);
+            self.dispatch(&qn);
+        }
+        for qn in waiting {
             self.dispatch(&qn);
         }
         Ok(())
@@ -1055,18 +1270,253 @@ impl Broker {
             return;
         };
         let all = std::mem::take(&mut c.unacked);
-        let mut touched = Vec::new();
-        for (_, (qn, mut m)) in all.into_iter().rev() {
-            if let Some(q) = self.queues.get_mut(&qn) {
-                m.redelivered = true;
-                q.msgs.push_front(m);
-            }
-            if !touched.contains(&qn) {
-                touched.push(qn);
+        for (qn, msgs) in group_by_queue(all.into_values().collect()) {
+            self.requeue(&qn, msgs);
+            self.dispatch(&qn);
+        }
+    }
+
+    // ---- queue arguments: max-length, TTL, delivery limit, dead-lettering --------
+
+    /// Append to a queue, applying `x-max-length`. Returns false if the queue
+    /// rejected the message (`x-overflow=reject-publish`).
+    fn enqueue(&mut self, qn: &str, msg: &Arc<Msg>) -> bool {
+        let persist = msg.persistent && self.store.is_some();
+        let now = Instant::now() + self.clock_skew;
+        let Some(q) = self.queues.get_mut(qn) else {
+            return false;
+        };
+        let mut victim = None;
+        if let Some(max) = q.cfg.max_length {
+            if q.msgs.len() >= max {
+                if q.cfg.overflow == Overflow::DropHead {
+                    victim = q.msgs.pop_front();
+                } else {
+                    let dl = q.cfg.overflow == Overflow::RejectPublishDlx;
+                    if dl {
+                        self.dead_letter(qn, msg.clone(), "maxlen");
+                    }
+                    return false;
+                }
             }
         }
-        for qn in touched {
-            self.dispatch(&qn);
+        let mut id = 0;
+        if persist && q.durable && q.exclusive.is_none() {
+            self.next_msg += 1;
+            id = self.next_msg;
+        }
+        let ttl = match (q.cfg.ttl_ms, msg.ttl_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        q.msgs.push_back(Entry {
+            msg: msg.clone(),
+            redelivered: false,
+            id,
+            delivery_count: 0,
+            expires_at: ttl.map(|t| now + Duration::from_millis(t)),
+        });
+        if id != 0 {
+            self.persist(|| Op::Enqueue {
+                id,
+                queue: qn.to_string(),
+                msg: msg.clone(),
+            });
+        }
+        if let Some(v) = victim {
+            if v.id != 0 {
+                let vid = v.id;
+                self.persist(|| Op::Remove(vec![vid]));
+            }
+            self.dead_letter(qn, v.msg, "maxlen");
+        }
+        true
+    }
+
+    /// Return messages (in delivery order) to the head of a queue, counting
+    /// redeliveries on quorum queues and enforcing their delivery limit.
+    fn requeue(&mut self, qn: &str, entries: Vec<Entry>) {
+        let Some(q) = self.queues.get_mut(qn) else {
+            return;
+        };
+        let (quorum, limit) = (q.cfg.quorum, q.cfg.delivery_limit);
+        let mut keep = Vec::new();
+        let mut over = Vec::new();
+        for mut e in entries {
+            e.redelivered = true;
+            if quorum {
+                e.delivery_count += 1;
+                if limit.is_some_and(|l| e.delivery_count > l) {
+                    over.push(e);
+                    continue;
+                }
+            }
+            keep.push(e);
+        }
+        for e in keep.into_iter().rev() {
+            q.msgs.push_front(e);
+        }
+        for e in over {
+            if e.id != 0 {
+                let id = e.id;
+                self.persist(|| Op::Remove(vec![id]));
+            }
+            self.dead_letter(qn, e.msg, "delivery_limit");
+        }
+    }
+
+    /// Republish `msg` to the queue's dead-letter exchange (if any), recording `x-death`.
+    fn dead_letter(&mut self, qn: &str, msg: Arc<Msg>, reason: &str) {
+        let Some(q) = self.queues.get(qn) else { return };
+        let Some(dlx) = q.cfg.dlx.clone() else { return };
+        let rk = q
+            .cfg
+            .dlrk
+            .clone()
+            .unwrap_or_else(|| msg.routing_key.clone());
+        if !self.exchanges.contains_key(&dlx) {
+            return;
+        }
+        let Ok(mut props) = parse_props(&msg.props) else {
+            return;
+        };
+        let s = |x: &str| Value::Str(x.as_bytes().to_vec());
+        let field = |t: &Table, k: &str| t.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let mut headers = props.headers.take().unwrap_or_default();
+        let mut deaths: Vec<Table> = match headers.iter().position(|(k, _)| k == "x-death") {
+            Some(i) => match headers.remove(i).1 {
+                Value::Array(a) => a
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::Table(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => vec![],
+            },
+            None => vec![],
+        };
+        let entry = match deaths
+            .iter()
+            .position(|t| field(t, "queue") == Some(s(qn)) && field(t, "reason") == Some(s(reason)))
+        {
+            Some(i) => {
+                let mut t = deaths.remove(i);
+                for (k, v) in t.iter_mut() {
+                    if let (true, Value::I64(c)) = (k == "count", &mut *v) {
+                        *c += 1;
+                    }
+                }
+                t
+            }
+            None => {
+                let mut t: Table = vec![
+                    ("count".into(), Value::I64(1)),
+                    ("exchange".into(), s(&msg.exchange)),
+                    ("queue".into(), s(qn)),
+                    ("reason".into(), s(reason)),
+                    (
+                        "routing-keys".into(),
+                        Value::Array(vec![s(&msg.routing_key)]),
+                    ),
+                    ("time".into(), Value::Timestamp(now_secs())),
+                ];
+                if let (true, Some(exp)) = (reason == "expired", &props.expiration) {
+                    t.push(("original-expiration".into(), s(exp)));
+                }
+                t
+            }
+        };
+        deaths.insert(0, entry);
+        if !headers.iter().any(|(k, _)| k == "x-first-death-queue") {
+            headers.push(("x-first-death-exchange".into(), s(&msg.exchange)));
+            headers.push(("x-first-death-queue".into(), s(qn)));
+            headers.push(("x-first-death-reason".into(), s(reason)));
+        }
+        headers.push((
+            "x-death".into(),
+            Value::Array(deaths.iter().cloned().map(Value::Table).collect()),
+        ));
+        props.expiration = None;
+        props.headers = Some(headers.clone());
+        let m = Arc::new(Msg {
+            exchange: dlx.clone(),
+            routing_key: rk.clone(),
+            headers,
+            props: props.encode(),
+            body: msg.body.clone(),
+            persistent: msg.persistent,
+            ttl_ms: None,
+        });
+        let mut qs = Vec::new();
+        self.route(&dlx, &rk, &m.headers, &mut qs, &mut HashSet::new());
+        // RabbitMQ drops a dead-lettered message that would return to a queue it already
+        // died in, unless it was ever rejected (this breaks expiry/overflow cycles).
+        let rejected_before = deaths
+            .iter()
+            .any(|t| field(t, "reason") == Some(s("rejected")));
+        for q2 in qs {
+            if !rejected_before && deaths.iter().any(|t| field(t, "queue") == Some(s(&q2))) {
+                continue;
+            }
+            if self.enqueue(&q2, &m) {
+                self.dispatch(&q2);
+            }
+        }
+    }
+
+    /// Dead-letter (or drop) messages at the head of a queue whose TTL has passed.
+    fn expire_head(&mut self, qn: &str) {
+        loop {
+            let now = Instant::now() + self.clock_skew;
+            let Some(q) = self.queues.get_mut(qn) else {
+                return;
+            };
+            let expired = q
+                .msgs
+                .front()
+                .is_some_and(|e| e.expires_at.is_some_and(|t| t <= now));
+            if !expired {
+                return;
+            }
+            let e = q.msgs.pop_front().unwrap();
+            if e.id != 0 {
+                let id = e.id;
+                self.persist(|| Op::Remove(vec![id]));
+            }
+            self.dead_letter(qn, e.msg, "expired");
+        }
+    }
+
+    /// Chaos: move the TTL clock forward and expire whatever is now due.
+    pub fn advance_clock(&mut self, ms: u64) {
+        self.clock_skew += Duration::from_millis(ms);
+        self.sweep();
+    }
+
+    /// Chaos: expire every ready message in a queue right now (dead-lettering if configured).
+    /// Returns how many were expired, or None if the queue doesn't exist.
+    pub fn expire_all(&mut self, name: &str) -> Option<usize> {
+        let now = Instant::now() + self.clock_skew;
+        let q = self.queues.get_mut(name)?;
+        let before = q.msgs.len();
+        for e in q.msgs.iter_mut() {
+            e.expires_at = Some(now);
+        }
+        self.expire_head(name);
+        Some(before - self.queues.get(name).map_or(0, |q| q.msgs.len()))
+    }
+
+    /// Expire due messages in every queue; called periodically.
+    pub fn sweep(&mut self) {
+        let names: Vec<String> = self
+            .queues
+            .iter()
+            .filter(|(_, q)| q.msgs.front().is_some_and(|e| e.expires_at.is_some()))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in names {
+            self.expire_head(&n);
         }
     }
 }

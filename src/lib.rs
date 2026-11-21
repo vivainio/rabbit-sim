@@ -27,6 +27,14 @@ pub fn flush(broker: &Shared) {
 
 /// Accept AMQP connections on `listener` forever.
 pub async fn serve_amqp(listener: TcpListener, broker: Shared, verbose: bool) {
+    let sweeper = broker.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tick.tick().await;
+            sweeper.lock().unwrap().sweep();
+        }
+    });
     loop {
         let Ok((sock, _)) = listener.accept().await else {
             continue;
