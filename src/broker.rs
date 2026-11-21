@@ -289,6 +289,8 @@ pub struct Broker {
     next_msg: i64,
     /// Added to the real clock for message TTLs; moved forward via the chaos API.
     clock_skew: Duration,
+    /// RabbitMQ major version whose stricter behaviour is emulated (0 or 3 = permissive, 4 = RabbitMQ 4).
+    rabbitmq_major: u8,
 }
 
 fn esc(s: &str) -> String {
@@ -365,6 +367,12 @@ fn headers_match(args: &Table, hdr: &Table) -> bool {
 }
 
 impl Broker {
+    /// Emulate the stricter behaviour of a RabbitMQ major version. At 4, declaring a transient queue that is not
+    /// exclusive is refused, as RabbitMQ 4 does unless `transient_nonexcl_queues` is permitted.
+    pub fn set_rabbitmq_major(&mut self, major: u8) {
+        self.rabbitmq_major = major;
+    }
+
     pub fn new() -> Self {
         let mut b = Broker::default();
         for (n, k) in [
@@ -770,6 +778,12 @@ impl Broker {
         auto_delete: bool,
         args: Table,
     ) -> Res<(String, u32, u32)> {
+        if !passive && self.rabbitmq_major >= 4 && !durable && !exclusive {
+            return Err(AmqpErr::conn(
+                INTERNAL_ERROR,
+                "INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated.\nBy default, this feature is not permitted anymore.\nThe feature will be removed from a future major RabbitMQ version, regardless of the configuration; actual version to be determined.\nTo continue using this feature when it is not permitted by default, set the following parameter in your configuration:\n    \"deprecated_features.permit.transient_nonexcl_queues = true\"",
+            ));
+        }
         let name = if name.is_empty() {
             let n = self.next_id();
             format!("amq.gen-{n:08x}")

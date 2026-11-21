@@ -43,6 +43,7 @@ pub const CHANNEL_ERROR: u16 = 504;
 pub const UNEXPECTED_FRAME: u16 = 505;
 pub const NOT_ALLOWED: u16 = 530;
 pub const NOT_IMPLEMENTED: u16 = 540;
+pub const INTERNAL_ERROR: u16 = 541;
 
 /// An AMQP exception. `hard` errors close the connection, others only the channel.
 #[derive(Debug)]

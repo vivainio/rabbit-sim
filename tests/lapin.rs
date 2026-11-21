@@ -1283,3 +1283,80 @@ async fn chaos_clock_and_expire_via_http() {
         .await
         .starts_with("HTTP/1.1 404"));
 }
+
+async fn start_emulating(major: u8) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let broker = rabbit_sim::new_broker();
+    broker.lock().unwrap().set_rabbitmq_major(major);
+    tokio::spawn(rabbit_sim::serve_amqp(l, broker, false));
+    format!("amqp://127.0.0.1:{port}/%2f")
+}
+
+#[tokio::test]
+async fn rabbitmq_4_refuses_transient_queues_that_are_not_exclusive() {
+    let url = start_emulating(4).await;
+
+    // Durable and exclusive queues are fine.
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        "durable".into(),
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    ch.queue_declare(
+        "exclusive".into(),
+        QueueDeclareOptions {
+            exclusive: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    // A passive check never creates a queue, so it is not refused for its flags.
+    ch.queue_declare(
+        "durable".into(),
+        QueueDeclareOptions {
+            passive: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+
+    // A transient queue that anyone can use is refused, and the broker closes the connection.
+    let err = ch
+        .queue_declare(
+            "transient".into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect_err("RabbitMQ 4 refuses transient non-exclusive queues");
+    assert!(
+        err.to_string().contains("transient_nonexcl_queues"),
+        "the error names the deprecated feature: {err}"
+    );
+}
+
+#[tokio::test]
+async fn rabbitmq_3_still_accepts_transient_queues() {
+    let url = start_emulating(3).await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.queue_declare(
+        "transient".into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+}

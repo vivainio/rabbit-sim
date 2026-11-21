@@ -23,6 +23,7 @@ Standalone binaries for Linux, macOS (Intel/Apple Silicon) and Windows are attac
 | `-p, --port PORT` | `5672` | AMQP port |
 | `-m, --http-port PORT` | `15672` | management UI/API port, `0` disables it |
 | `-d, --data FILE` | none | SQLite file for persistence; omit for pure in-memory |
+| `-r, --rabbitmq 3\|4` | `3` | emulate the stricter behaviour of a RabbitMQ major version (see below) |
 | `-v, --verbose` | off | log connects, disconnects and errors |
 
 Any username and password are accepted, and all clients share one vhost.
@@ -71,6 +72,9 @@ Time-dependent behaviour is slow to test, so the broker's TTL clock can be drive
 
 Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock;
 heartbeats and everything else run on real time.
+
+## Version behaviour
+rabbit-sim is not a particular RabbitMQ release. With `--rabbitmq 4` it refuses what RabbitMQ 4 refuses by default, so a test that would fail there fails here too. Today that is declaring a transient (non-durable) queue that is not exclusive, which RabbitMQ 4 rejects with `INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated` and a connection close. The default, `--rabbitmq 3`, accepts such queues. Run against both settings, and still check a real broker before a release.
 
 ## Not supported
 - Clustering, replication, TLS, real authentication, multiple vhosts, a drop-in RabbitMQ management API
