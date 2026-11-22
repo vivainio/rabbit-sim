@@ -5,7 +5,7 @@ rabbit-sim is a single-binary AMQP 0-9-1 broker for local development and tests.
 It is not RabbitMQ. It behaves like RabbitMQ where tests usually look, and it adds what a real broker cannot give you: faults on demand. You can hold publisher confirms, deliveries and acks back, decline publishes, and move the TTL clock forward, all over HTTP.
 
 - [Getting started](getting-started.md) installs the broker, runs it and lists its options.
-- [What it supports](supported.md) lists exchanges, queues, consuming and queue arguments.
+- [What it supports](supported.md) lists exchanges, queues, consuming, queue arguments and vhosts.
 - [Persistence](persistence.md) explains what survives a restart with `--data`.
 - [Management UI and API](management.md) covers the web page and its JSON endpoints.
 - [RabbitMQ version behaviour](versions.md) explains `--rabbitmq 3|4`.

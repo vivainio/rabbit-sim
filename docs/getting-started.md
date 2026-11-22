@@ -17,7 +17,7 @@ rabbit-sim --port 5679 -v          # custom port, log connections and protocol e
 rabbit-sim --data broker.db        # persist durable state to SQLite
 ```
 
-Any username and password are accepted, and all clients share one vhost.
+Any username and password are accepted. A vhost is created the first time a client opens it, so `amqp://127.0.0.1/tenant-a` works with no setup. See [vhosts](supported.md#vhosts).
 
 ## Options
 

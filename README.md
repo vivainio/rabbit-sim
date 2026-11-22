@@ -27,7 +27,7 @@ Standalone binaries for Linux, macOS (Intel/Apple Silicon) and Windows are attac
 | `-c, --confirm-delay MS` | `0` | hold every publisher confirm back by MS milliseconds, like a loaded or distant broker |
 | `-v, --verbose` | off | log connects, disconnects and errors |
 
-Any username and password are accepted, and all clients share one vhost.
+Any username and password are accepted. A vhost is created the first time a client opens it, and each has its own exchanges, queues and bindings (see Vhosts).
 
 ## Supported
 - Exchanges: direct, fanout, topic, headers, exchange-to-exchange bindings, default exchange and `amq.*`
@@ -48,6 +48,12 @@ Any username and password are accepted, and all clients share one vhost.
 Redeclaring a queue with different arguments fails with `PRECONDITION_FAILED - inequivalent arg ...`, as in RabbitMQ.
 
 Tested with the Rust `lapin` client (the test suite) and the .NET `RabbitMQ.Client` 6.x, including a broker kill and restart.
+
+## Vhosts
+Connect to any vhost, such as `amqp://127.0.0.1/tenant-a`, and it exists. Each vhost has its own default exchange, `amq.*` exchanges, queues and bindings,
+so the same names in two vhosts are separate objects, and dead-letter exchanges are looked up in the queue's own vhost. There is nothing to create or delete,
+and no permissions: any client may use any vhost. Persistence, the management API (`vhost` fields and `/api/queues/{vhost}/{name}`) and `/chaos/queues/{vhost}/{name}/expire`
+all know about vhosts. Fault injection settings and the TTL clock are global.
 
 ## Persistence (optional)
 With `--data`, state is saved to a SQLite file and restored on start, following RabbitMQ's rules:
@@ -93,7 +99,7 @@ All of them use real time.
 rabbit-sim is not a particular RabbitMQ release. With `--rabbitmq 4` it refuses what RabbitMQ 4 refuses by default, so a test that would fail there fails here too. Today that is declaring a transient (non-durable) queue that is not exclusive, which RabbitMQ 4 rejects with `INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated` and a connection close. The default, `--rabbitmq 3`, accepts such queues. Run against both settings, and still check a real broker before a release.
 
 ## Not supported
-- Clustering, replication, TLS, real authentication, multiple vhosts, a drop-in RabbitMQ management API
+- Clustering, replication, TLS, real authentication, vhost permissions or limits, a drop-in RabbitMQ management API
 - Transactions (`tx.*` returns NOT_IMPLEMENTED)
 - Other queue arguments (`x-expires`, `x-max-priority`, `x-max-length-bytes`, `x-single-active-consumer`, ...)
   are accepted but ignored; quorum queues only emulate delivery counting/limits, and streams are rejected

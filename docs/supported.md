@@ -6,6 +6,12 @@
 - Consuming: `basic.get`, consume and cancel, ack, nack, reject and recover, `basic.qos` prefetch (per channel), round-robin dispatch, and redelivery when a channel or connection closes.
 - Heartbeats, consumer cancel notification, and RabbitMQ-style channel and connection error codes and texts.
 
+## Vhosts
+
+Connect to any vhost and it exists. Each vhost has its own default exchange, `amq.*` exchanges, queues and bindings, so two vhosts can both declare a queue called `orders` and they are separate queues. A dead-letter exchange named in a queue's arguments is looked up in that queue's own vhost.
+
+There is nothing to create or delete, and no permissions: any client may use any vhost, and a misspelled vhost in a connection string quietly gives you an empty one. Fault-injection settings and the TTL clock are global, not per vhost.
+
 It is tested with the Rust `lapin` client (the test suite) and the .NET `RabbitMQ.Client` 6.x, including a broker kill and restart.
 
 ## Queue arguments

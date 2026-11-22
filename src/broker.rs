@@ -76,9 +76,12 @@ fn str_of(v: &Value) -> Option<String> {
 }
 
 fn bad_arg(name: &str, key: &str) -> AmqpErr {
+    let (name_v, name_l) = (vhost_of(name), local_name(name));
     AmqpErr::chan(
         PRECONDITION_FAILED,
-        format!("PRECONDITION_FAILED - invalid arg '{key}' for queue '{name}' in vhost '/'"),
+        format!(
+            "PRECONDITION_FAILED - invalid arg '{key}' for queue '{name_l}' in vhost '{name_v}'"
+        ),
     )
 }
 
@@ -262,6 +265,7 @@ pub struct Queue {
 }
 
 struct ConnInfo {
+    vhost: String,
     tx: Tx,
     frame_max: usize,
     peer: String,
@@ -367,6 +371,28 @@ fn next_due(delay: Duration, last: &mut Option<tokio::time::Instant>) -> tokio::
     due
 }
 
+/// Exchanges and queues are keyed by name qualified with their vhost. The default vhost "/" keeps the bare name, so
+/// existing data files and the single-vhost behaviour are unchanged; any other vhost prefixes `vhost` and a separator.
+const VSEP: char = '\u{1}';
+
+pub fn qualify(vhost: &str, name: &str) -> String {
+    if vhost == "/" {
+        name.to_string()
+    } else {
+        format!("{vhost}{VSEP}{name}")
+    }
+}
+
+/// The vhost a qualified key belongs to.
+pub fn vhost_of(key: &str) -> &str {
+    key.split_once(VSEP).map_or("/", |(v, _)| v)
+}
+
+/// The name a client gave, without its vhost.
+pub fn local_name(key: &str) -> &str {
+    key.split_once(VSEP).map_or(key, |(_, n)| n)
+}
+
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -397,15 +423,17 @@ fn bind_row(source: &str, b: &Binding) -> BindRow {
 }
 
 fn no_queue(n: &str) -> AmqpErr {
+    let (n_v, n_l) = (vhost_of(n), local_name(n));
     AmqpErr::chan(
         NOT_FOUND,
-        format!("NOT_FOUND - no queue '{n}' in vhost '/'"),
+        format!("NOT_FOUND - no queue '{n_l}' in vhost '{n_v}'"),
     )
 }
 fn no_exchange(n: &str) -> AmqpErr {
+    let (n_v, n_l) = (vhost_of(n), local_name(n));
     AmqpErr::chan(
         NOT_FOUND,
-        format!("NOT_FOUND - no exchange '{n}' in vhost '/'"),
+        format!("NOT_FOUND - no exchange '{n_l}' in vhost '{n_v}'"),
     )
 }
 
@@ -518,6 +546,12 @@ impl Broker {
 
     pub fn new() -> Self {
         let mut b = Broker::default();
+        b.add_default_exchanges("/");
+        b
+    }
+
+    /// Create the default exchange and the `amq.*` exchanges of a vhost that has none yet.
+    fn add_default_exchanges(&mut self, vhost: &str) {
         for (n, k) in [
             ("", Kind::Direct),
             ("amq.direct", Kind::Direct),
@@ -526,18 +560,14 @@ impl Broker {
             ("amq.headers", Kind::Headers),
             ("amq.match", Kind::Headers),
         ] {
-            b.exchanges.insert(
-                n.into(),
-                Exchange {
-                    kind: k,
-                    durable: true,
-                    auto_delete: false,
-                    bindings: vec![],
-                    had_bindings: false,
-                },
-            );
+            self.exchanges.entry(qualify(vhost, n)).or_insert(Exchange {
+                kind: k,
+                durable: true,
+                auto_delete: false,
+                bindings: vec![],
+                had_bindings: false,
+            });
         }
-        b
     }
 
     /// Open (or create) a SQLite-backed broker and restore its durable state.
@@ -653,11 +683,14 @@ impl Broker {
 
     // ---- connections & channels -------------------------------------------------
 
-    pub fn register(&mut self, tx: Tx, frame_max: usize, peer: String) -> ConnId {
+    /// Register a connection to `vhost`. A vhost is created the first time a client opens it.
+    pub fn register(&mut self, tx: Tx, frame_max: usize, peer: String, vhost: &str) -> ConnId {
+        self.add_default_exchanges(vhost);
         self.next_conn += 1;
         self.conns.insert(
             self.next_conn,
             ConnInfo {
+                vhost: vhost.to_string(),
                 tx,
                 frame_max,
                 peer,
@@ -732,6 +765,7 @@ impl Broker {
         durable: bool,
         auto_delete: bool,
     ) -> Res<()> {
+        let (name_v, name_l) = (vhost_of(name), local_name(name));
         if let Some(e) = self.exchanges.get(name) {
             if passive {
                 return Ok(());
@@ -740,7 +774,7 @@ impl Broker {
                 return Err(AmqpErr::chan(
                     PRECONDITION_FAILED,
                     format!(
-                        "PRECONDITION_FAILED - inequivalent arg 'type' for exchange '{name}' in vhost '/': received '{kind}' but current is '{}'",
+                        "PRECONDITION_FAILED - inequivalent arg 'type' for exchange '{name_l}' in vhost '{name_v}': received '{kind}' but current is '{}'",
                         e.kind.name()
                     ),
                 ));
@@ -748,7 +782,7 @@ impl Broker {
             if e.durable != durable || e.auto_delete != auto_delete {
                 return Err(AmqpErr::chan(
                     PRECONDITION_FAILED,
-                    format!("PRECONDITION_FAILED - inequivalent arg 'durable/auto_delete' for exchange '{name}' in vhost '/'"),
+                    format!("PRECONDITION_FAILED - inequivalent arg 'durable/auto_delete' for exchange '{name_l}' in vhost '{name_v}'"),
                 ));
             }
             return Ok(());
@@ -756,10 +790,13 @@ impl Broker {
         if passive {
             return Err(no_exchange(name));
         }
-        if name.starts_with("amq.") {
+        if local_name(name).starts_with("amq.") {
             return Err(AmqpErr::chan(
                 ACCESS_REFUSED,
-                format!("ACCESS_REFUSED - exchange name '{name}' contains reserved prefix 'amq.*'"),
+                format!(
+                    "ACCESS_REFUSED - exchange name '{}' contains reserved prefix 'amq.*'",
+                    local_name(name)
+                ),
             ));
         }
         let k = Kind::parse(kind).ok_or_else(|| {
@@ -789,10 +826,14 @@ impl Broker {
     }
 
     pub fn delete_exchange(&mut self, name: &str, if_unused: bool) -> Res<()> {
-        if name.is_empty() || name.starts_with("amq.") {
+        let (name_v, name_l) = (vhost_of(name), local_name(name));
+        if local_name(name).is_empty() || local_name(name).starts_with("amq.") {
             return Err(AmqpErr::chan(
                 ACCESS_REFUSED,
-                format!("ACCESS_REFUSED - operation not permitted on the exchange '{name}'"),
+                format!(
+                    "ACCESS_REFUSED - operation not permitted on the exchange '{}'",
+                    local_name(name)
+                ),
             ));
         }
         let Some(e) = self.exchanges.get(name) else {
@@ -801,7 +842,7 @@ impl Broker {
         if if_unused && !e.bindings.is_empty() {
             return Err(AmqpErr::chan(
                 PRECONDITION_FAILED,
-                format!("PRECONDITION_FAILED - exchange '{name}' in vhost '/' in use"),
+                format!("PRECONDITION_FAILED - exchange '{name_l}' in vhost '{name_v}' in use"),
             ));
         }
         if let Some(e) = self.exchanges.remove(name) {
@@ -838,7 +879,7 @@ impl Broker {
             Dest::Exchange(x) if !self.exchanges.contains_key(x) => return Err(no_exchange(x)),
             _ => {}
         }
-        if source.is_empty() {
+        if local_name(source).is_empty() {
             return Err(AmqpErr::chan(
                 ACCESS_REFUSED,
                 "ACCESS_REFUSED - operation not permitted on the default exchange",
@@ -900,11 +941,12 @@ impl Broker {
     // ---- queues -----------------------------------------------------------------
 
     fn check_queue(&self, conn: ConnId, name: &str) -> Res<&Queue> {
+        let (name_v, name_l) = (vhost_of(name), local_name(name));
         let q = self.queues.get(name).ok_or_else(|| no_queue(name))?;
         match q.exclusive {
             Some(o) if o != conn => Err(AmqpErr::chan(
                 RESOURCE_LOCKED,
-                format!("RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{name}' in vhost '/'"),
+                format!("RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{name_l}' in vhost '{name_v}'"),
             )),
             _ => Ok(q),
         }
@@ -921,15 +963,16 @@ impl Broker {
         auto_delete: bool,
         args: Table,
     ) -> Res<(String, u32, u32)> {
+        let (name_v, name_l) = (vhost_of(name), local_name(name));
         if !passive && self.rabbitmq_major >= 4 && !durable && !exclusive {
             return Err(AmqpErr::conn(
                 INTERNAL_ERROR,
                 "INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated.\nBy default, this feature is not permitted anymore.\nThe feature will be removed from a future major RabbitMQ version, regardless of the configuration; actual version to be determined.\nTo continue using this feature when it is not permitted by default, set the following parameter in your configuration:\n    \"deprecated_features.permit.transient_nonexcl_queues = true\"",
             ));
         }
-        let name = if name.is_empty() {
+        let name = if local_name(name).is_empty() {
             let n = self.next_id();
-            format!("amq.gen-{n:08x}")
+            qualify(vhost_of(name), &format!("amq.gen-{n:08x}"))
         } else {
             name.to_string()
         };
@@ -938,7 +981,7 @@ impl Broker {
             if !passive && (q.durable != durable || q.auto_delete != auto_delete) {
                 return Err(AmqpErr::chan(
                     PRECONDITION_FAILED,
-                    format!("PRECONDITION_FAILED - inequivalent arg 'durable/auto_delete' for queue '{name}' in vhost '/'"),
+                    format!("PRECONDITION_FAILED - inequivalent arg 'durable/auto_delete' for queue '{name_l}' in vhost '{name_v}'"),
                 ));
             }
             if !passive {
@@ -946,22 +989,29 @@ impl Broker {
                     return Err(AmqpErr::chan(
                         PRECONDITION_FAILED,
                         format!(
-                            "PRECONDITION_FAILED - inequivalent arg '{k}' for queue '{name}' in vhost '/': received '{}' but current is '{}'",
+                            "PRECONDITION_FAILED - inequivalent arg '{k}' for queue '{name_l}' in vhost '{name_v}': received '{}' but current is '{}'",
                             fmt_val(got),
                             fmt_val(cur)
                         ),
                     ));
                 }
             }
-            return Ok((name.clone(), q.msgs.len() as u32, q.consumers.len() as u32));
+            return Ok((
+                local_name(&name).to_string(),
+                q.msgs.len() as u32,
+                q.consumers.len() as u32,
+            ));
         }
         if passive {
             return Err(no_queue(&name));
         }
-        if name.starts_with("amq.") && !name.starts_with("amq.gen-") {
+        if local_name(&name).starts_with("amq.") && !local_name(&name).starts_with("amq.gen-") {
             return Err(AmqpErr::chan(
                 ACCESS_REFUSED,
-                format!("ACCESS_REFUSED - queue name '{name}' contains reserved prefix 'amq.*'"),
+                format!(
+                    "ACCESS_REFUSED - queue name '{}' contains reserved prefix 'amq.*'",
+                    local_name(&name)
+                ),
             ));
         }
         let cfg = parse_cfg(&name, &args)?;
@@ -978,7 +1028,7 @@ impl Broker {
             if let Some(prop) = bad {
                 return Err(AmqpErr::chan(
                     PRECONDITION_FAILED,
-                    format!("PRECONDITION_FAILED - invalid property '{prop}' for queue '{name}' in vhost '/'"),
+                    format!("PRECONDITION_FAILED - invalid property '{prop}' for queue '{name_l}' in vhost '{name_v}'"),
                 ));
             }
         }
@@ -1003,7 +1053,7 @@ impl Broker {
                 cfg,
             },
         );
-        Ok((name, 0, 0))
+        Ok((local_name(&name).to_string(), 0, 0))
     }
 
     /// Drop all ready messages (unacked ones are untouched), returning how many.
@@ -1033,6 +1083,7 @@ impl Broker {
         if_unused: bool,
         if_empty: bool,
     ) -> Res<u32> {
+        let (name_v, name_l) = (vhost_of(name), local_name(name));
         let Some(q) = self.queues.get(name) else {
             return Ok(0);
         };
@@ -1040,13 +1091,13 @@ impl Broker {
         if if_unused && !q.consumers.is_empty() {
             return Err(AmqpErr::chan(
                 PRECONDITION_FAILED,
-                format!("PRECONDITION_FAILED - queue '{name}' in vhost '/' in use"),
+                format!("PRECONDITION_FAILED - queue '{name_l}' in vhost '{name_v}' in use"),
             ));
         }
         if if_empty && !q.msgs.is_empty() {
             return Err(AmqpErr::chan(
                 PRECONDITION_FAILED,
-                format!("PRECONDITION_FAILED - queue '{name}' in vhost '/' is not empty"),
+                format!("PRECONDITION_FAILED - queue '{name_l}' in vhost '{name_v}' is not empty"),
             ));
         }
         let n = q.msgs.len() as u32;
@@ -1098,9 +1149,10 @@ impl Broker {
         out: &mut Vec<String>,
         seen: &mut HashSet<String>,
     ) {
-        if ex.is_empty() {
-            if self.queues.contains_key(rk) && !out.iter().any(|q| q == rk) {
-                out.push(rk.to_string());
+        if local_name(ex).is_empty() {
+            let q = qualify(vhost_of(ex), rk);
+            if self.queues.contains_key(&q) && !out.contains(&q) {
+                out.push(q);
             }
             return;
         }
@@ -1168,7 +1220,7 @@ impl Broker {
             let mut b = method(ch, 60, 50, |w| {
                 w.u16(312);
                 w.short("NO_ROUTE");
-                w.short(exchange);
+                w.short(local_name(exchange));
                 w.short(rk);
             });
             b.extend(content(ch, &msg.props, &msg.body, frame_max));
@@ -1210,11 +1262,12 @@ impl Broker {
         no_ack: bool,
         exclusive: bool,
     ) -> Res<String> {
+        let (queue_v, queue_l) = (vhost_of(queue), local_name(queue));
         let q = self.check_queue(conn, queue)?;
         if q.consumers.iter().any(|c| c.exclusive) || (exclusive && !q.consumers.is_empty()) {
             return Err(AmqpErr::chan(
                 ACCESS_REFUSED,
-                format!("ACCESS_REFUSED - queue '{queue}' in vhost '/' in exclusive use"),
+                format!("ACCESS_REFUSED - queue '{queue_l}' in vhost '{queue_v}' in exclusive use"),
             ));
         }
         let tag = if tag.is_empty() {
@@ -1546,12 +1599,13 @@ impl Broker {
     fn dead_letter(&mut self, qn: &str, msg: Arc<Msg>, reason: &str) {
         let Some(q) = self.queues.get(qn) else { return };
         let Some(dlx) = q.cfg.dlx.clone() else { return };
+        let dlx_key = qualify(vhost_of(qn), &dlx);
         let rk = q
             .cfg
             .dlrk
             .clone()
             .unwrap_or_else(|| msg.routing_key.clone());
-        if !self.exchanges.contains_key(&dlx) {
+        if !self.exchanges.contains_key(&dlx_key) {
             return;
         }
         let Ok(mut props) = parse_props(&msg.props) else {
@@ -1573,10 +1627,9 @@ impl Broker {
             },
             None => vec![],
         };
-        let entry = match deaths
-            .iter()
-            .position(|t| field(t, "queue") == Some(s(qn)) && field(t, "reason") == Some(s(reason)))
-        {
+        let entry = match deaths.iter().position(|t| {
+            field(t, "queue") == Some(s(local_name(qn))) && field(t, "reason") == Some(s(reason))
+        }) {
             Some(i) => {
                 let mut t = deaths.remove(i);
                 for (k, v) in t.iter_mut() {
@@ -1590,7 +1643,7 @@ impl Broker {
                 let mut t: Table = vec![
                     ("count".into(), Value::I64(1)),
                     ("exchange".into(), s(&msg.exchange)),
-                    ("queue".into(), s(qn)),
+                    ("queue".into(), s(local_name(qn))),
                     ("reason".into(), s(reason)),
                     (
                         "routing-keys".into(),
@@ -1607,7 +1660,7 @@ impl Broker {
         deaths.insert(0, entry);
         if !headers.iter().any(|(k, _)| k == "x-first-death-queue") {
             headers.push(("x-first-death-exchange".into(), s(&msg.exchange)));
-            headers.push(("x-first-death-queue".into(), s(qn)));
+            headers.push(("x-first-death-queue".into(), s(local_name(qn))));
             headers.push(("x-first-death-reason".into(), s(reason)));
         }
         headers.push((
@@ -1626,14 +1679,18 @@ impl Broker {
             ttl_ms: None,
         });
         let mut qs = Vec::new();
-        self.route(&dlx, &rk, &m.headers, &mut qs, &mut HashSet::new());
+        self.route(&dlx_key, &rk, &m.headers, &mut qs, &mut HashSet::new());
         // RabbitMQ drops a dead-lettered message that would return to a queue it already
         // died in, unless it was ever rejected (this breaks expiry/overflow cycles).
         let rejected_before = deaths
             .iter()
             .any(|t| field(t, "reason") == Some(s("rejected")));
         for q2 in qs {
-            if !rejected_before && deaths.iter().any(|t| field(t, "queue") == Some(s(&q2))) {
+            if !rejected_before
+                && deaths
+                    .iter()
+                    .any(|t| field(t, "queue") == Some(s(local_name(&q2))))
+            {
                 continue;
             }
             if self.enqueue(&q2, &m) {
@@ -1738,8 +1795,9 @@ impl Broker {
             .map(|n| {
                 let q = &self.queues[n];
                 format!(
-                    "{{\"name\":{},\"durable\":{},\"auto_delete\":{},\"exclusive\":{},\"messages_ready\":{},\"messages_unacknowledged\":{},\"consumers\":{}}}",
-                    esc(n),
+                    "{{\"name\":{},\"vhost\":{},\"durable\":{},\"auto_delete\":{},\"exclusive\":{},\"messages_ready\":{},\"messages_unacknowledged\":{},\"consumers\":{}}}",
+                    esc(local_name(n)),
+                    esc(vhost_of(n)),
                     q.durable,
                     q.auto_delete,
                     q.exclusive.is_some(),
@@ -1760,8 +1818,9 @@ impl Broker {
             .map(|n| {
                 let e = &self.exchanges[n];
                 format!(
-                    "{{\"name\":{},\"type\":{},\"durable\":{},\"auto_delete\":{},\"bindings\":{}}}",
-                    esc(n),
+                    "{{\"name\":{},\"vhost\":{},\"type\":{},\"durable\":{},\"auto_delete\":{},\"bindings\":{}}}",
+                    esc(local_name(n)),
+                    esc(vhost_of(n)),
                     esc(e.kind.name()),
                     e.durable,
                     e.auto_delete,
@@ -1783,9 +1842,10 @@ impl Broker {
                     Dest::Exchange(x) => (x, "exchange"),
                 };
                 items.push(format!(
-                    "{{\"source\":{},\"destination\":{},\"destination_type\":\"{t}\",\"routing_key\":{}}}",
-                    esc(n),
-                    esc(d),
+                    "{{\"vhost\":{},\"source\":{},\"destination\":{},\"destination_type\":\"{t}\",\"routing_key\":{}}}",
+                    esc(vhost_of(n)),
+                    esc(local_name(n)),
+                    esc(local_name(d)),
                     esc(&b.key)
                 ));
             }
@@ -1802,7 +1862,8 @@ impl Broker {
                 let c = &self.conns[id];
                 let channels = self.chans.keys().filter(|(cid, _)| cid == id).count();
                 format!(
-                    "{{\"id\":{id},\"peer\":{},\"channels\":{channels},\"frame_max\":{}}}",
+                    "{{\"id\":{id},\"vhost\":{},\"peer\":{},\"channels\":{channels},\"frame_max\":{}}}",
+                    esc(&c.vhost),
                     esc(&c.peer),
                     c.frame_max
                 )

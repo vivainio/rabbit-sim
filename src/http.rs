@@ -1,6 +1,6 @@
 //! Minimal management HTTP server: JSON API plus a single embedded HTML page.
 
-use crate::broker::Chaos;
+use crate::broker::{qualify, Chaos};
 use crate::conn::Shared;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +27,12 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// "{vhost}/{name}" from a management URL, both percent-encoded, as the broker's qualified queue key.
+fn vhost_name(path: &str) -> String {
+    let (vhost, name) = path.split_once('/').unwrap_or(("%2F", path));
+    qualify(&percent_decode(vhost), &percent_decode(name))
 }
 
 fn respond(status: &str, ctype: &str, body: &str) -> Vec<u8> {
@@ -60,7 +66,7 @@ fn route(method: &str, path: &str, body: &str, broker: &Shared) -> Vec<u8> {
         // DELETE /api/queues/{vhost}/{name}/contents  -> purge
         ("DELETE", p) if p.starts_with("/api/queues/") && p.ends_with("/contents") => {
             let mid = &p["/api/queues/".len()..p.len() - "/contents".len()];
-            let name = percent_decode(mid.split_once('/').map_or(mid, |(_, n)| n));
+            let name = vhost_name(mid);
             match broker.lock().unwrap().purge_admin(&name) {
                 Some(n) => json(&format!("{{\"purged\":{n}}}")),
                 None => respond(
@@ -101,7 +107,7 @@ fn route(method: &str, path: &str, body: &str, broker: &Shared) -> Vec<u8> {
         // POST /chaos/queues/{vhost}/{name}/expire -> expire all ready messages now
         ("POST", p) if p.starts_with("/chaos/queues/") && p.ends_with("/expire") => {
             let mid = &p["/chaos/queues/".len()..p.len() - "/expire".len()];
-            let name = percent_decode(mid.split_once('/').map_or(mid, |(_, n)| n));
+            let name = vhost_name(mid);
             match broker.lock().unwrap().expire_all(&name) {
                 Some(n) => json(&format!("{{\"expired\":{n}}}")),
                 None => respond(

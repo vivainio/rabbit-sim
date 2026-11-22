@@ -30,7 +30,7 @@ Time-dependent behaviour is slow to test, so the broker's TTL clock can be drive
 
 ```text
 POST /chaos/clock/advance?ms=3600000          # move the TTL clock forward and expire what is due
-POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now
+POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now (%2F is the vhost)
 ```
 
 Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock. Heartbeats and everything else run on real time.

@@ -1,6 +1,6 @@
 //! Per-connection protocol handling: handshake, frame loop, method dispatch.
 
-use crate::broker::{Broker, ConnId, Dest, Msg, Tx};
+use crate::broker::{qualify, Broker, ConnId, Dest, Msg, Tx};
 use crate::codec::*;
 use std::collections::HashMap;
 use std::io;
@@ -62,6 +62,7 @@ struct Conn {
     tx: Tx,
     channels: HashMap<u16, ChState>,
     last_queue: String,
+    vhost: String,
     cur: (u16, u16),
 }
 
@@ -135,13 +136,17 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
     if f.ty != FRAME_METHOD || (c, m) != (10, 40) {
         return Err(bad("expected connection.open"));
     }
+    let vhost = match r.short().map_err(|_| bad("frame"))? {
+        v if v.is_empty() => "/".to_string(),
+        v => v,
+    };
 
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     let peer_s = peer.map_or("?".to_string(), |p| p.to_string());
     let id = broker
         .lock()
         .unwrap()
-        .register(tx.clone(), frame_max, peer_s.clone());
+        .register(tx.clone(), frame_max, peer_s.clone(), &vhost);
     if verbose {
         eprintln!("[{id}] connected from {peer_s}");
     }
@@ -178,6 +183,7 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
         tx,
         channels: HashMap::new(),
         last_queue: String::new(),
+        vhost,
         cur: (0, 0),
     };
 
@@ -332,17 +338,24 @@ impl Conn {
             persistent: p.persistent,
             ttl_ms: p.ttl_ms,
         });
+        let exchange_key = self.qn(&p.exchange);
         self.broker
             .lock()
             .unwrap()
-            .publish(self.id, ch, &p.exchange, &p.rk, p.mandatory, msg)
+            .publish(self.id, ch, &exchange_key, &p.rk, p.mandatory, msg)
     }
 
+    // The broker keys exchanges and queues by name qualified with the connection's vhost.
+    fn qn(&self, name: &str) -> String {
+        qualify(&self.vhost, name)
+    }
+
+    // The key of a queue the client named, or of the last one it declared when it left the name empty.
     fn queue_name(&self, q: String) -> String {
         if q.is_empty() {
-            self.last_queue.clone()
+            self.qn(&self.last_queue)
         } else {
-            q
+            self.qn(&q)
         }
     }
 
@@ -433,7 +446,7 @@ impl Conn {
             // exchange
             (40, 10) => {
                 r.u16()?;
-                let name = r.short()?;
+                let name = self.qn(&r.short()?);
                 let kind = r.short()?;
                 let bits = r.u8()?;
                 self.broker.lock().unwrap().declare_exchange(
@@ -449,7 +462,7 @@ impl Conn {
             }
             (40, 20) => {
                 r.u16()?;
-                let name = r.short()?;
+                let name = self.qn(&r.short()?);
                 let bits = r.u8()?;
                 self.broker
                     .lock()
@@ -461,8 +474,8 @@ impl Conn {
             }
             (40, 30) | (40, 40) => {
                 r.u16()?;
-                let dest = r.short()?;
-                let src = r.short()?;
+                let dest = self.qn(&r.short()?);
+                let src = self.qn(&r.short()?);
                 let key = r.short()?;
                 let bits = r.u8()?;
                 let args = r.table()?;
@@ -481,7 +494,7 @@ impl Conn {
             // queue
             (50, 10) => {
                 r.u16()?;
-                let name = r.short()?;
+                let name = self.qn(&r.short()?);
                 let bits = r.u8()?;
                 let args = r.table()?;
                 let (name, msgs, cons) = self.broker.lock().unwrap().declare_queue(
@@ -505,7 +518,7 @@ impl Conn {
             (50, 20) | (50, 50) => {
                 r.u16()?;
                 let q = self.queue_name(r.short()?);
-                let ex = r.short()?;
+                let ex = self.qn(&r.short()?);
                 let key = r.short()?;
                 let nowait = if m == 20 { r.u8()? & 1 != 0 } else { false };
                 let args = r.table()?;

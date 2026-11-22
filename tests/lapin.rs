@@ -1669,3 +1669,253 @@ async fn chaos_endpoint_replaces_all_settings_and_rejects_bad_bodies() {
         .await
         .contains(r#""ack_delay_ms":9"#));
 }
+
+// The same URL on another vhost.
+fn on_vhost(url: &str, vhost: &str) -> String {
+    format!("{}/{vhost}", url.trim_end_matches("/%2f"))
+}
+
+async fn declare_durable(ch: &lapin::Channel, q: &str) {
+    ch.queue_declare(
+        q.into(),
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+}
+
+async fn publish_to(ch: &lapin::Channel, exchange: &str, key: &str, body: &[u8]) {
+    ch.basic_publish(
+        exchange.into(),
+        key.into(),
+        BasicPublishOptions::default(),
+        body,
+        BasicProperties::default(),
+    )
+    .await
+    .unwrap()
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn vhosts_keep_queues_and_exchanges_apart() {
+    let (url, _hp) = start_with_http().await;
+    let a = connect(&on_vhost(&url, "tenant-a")).await;
+    let b = connect(&on_vhost(&url, "tenant-b")).await;
+    let root = connect(&url).await;
+    let (ca, cb, cr) = (
+        a.create_channel().await.unwrap(),
+        b.create_channel().await.unwrap(),
+        root.create_channel().await.unwrap(),
+    );
+
+    // the same names in three vhosts are three separate sets, and the default and amq.* exchanges exist in each
+    for ch in [&ca, &cb, &cr] {
+        declare_durable(ch, "orders").await;
+        ch.exchange_declare(
+            "ex".into(),
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        ch.queue_bind(
+            "orders".into(),
+            "ex".into(),
+            "k".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    }
+    publish_to(&ca, "", "orders", b"via default in a").await;
+    publish_to(&cb, "ex", "k", b"via ex in b").await;
+    publish_to(&cb, "amq.direct", "nobody", b"unrouted").await;
+
+    assert_eq!(
+        get_eventually(&ca, "orders").await.unwrap().data,
+        b"via default in a"
+    );
+    assert!(ca
+        .basic_get("orders".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        get_eventually(&cb, "orders").await.unwrap().data,
+        b"via ex in b"
+    );
+    assert!(cb
+        .basic_get("orders".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    // nothing reached the root vhost
+    assert!(cr
+        .basic_get("orders".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+
+    // the same name may be declared differently in another vhost, and a queue of one vhost is not found from another
+    cb.queue_declare(
+        "other".into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    let missing = ca
+        .queue_declare(
+            "other".into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await;
+    assert!(missing.is_err(), "tenant-a has no queue 'other'");
+}
+
+#[tokio::test]
+async fn vhosts_have_their_own_server_named_queues_dead_letters_and_ttl_clock() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&on_vhost(&url, "dl")).await;
+    let ch = conn.create_channel().await.unwrap();
+
+    // a server-named queue comes back with the name the client sees, and can be used by that name
+    let q = ch
+        .queue_declare(
+            "".into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    assert!(q.name().as_str().starts_with("amq.gen-"), "{}", q.name());
+    publish_to(&ch, "", q.name().as_str(), b"named by the server").await;
+    assert_eq!(
+        get_eventually(&ch, q.name().as_str()).await.unwrap().data,
+        b"named by the server"
+    );
+
+    // a dead-letter exchange named in the queue arguments is looked up in the queue's own vhost
+    ch.queue_declare(
+        "dead".into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-message-ttl".into(),
+        lapin::types::AMQPValue::LongUInt(1_000),
+    );
+    args.insert(
+        "x-dead-letter-exchange".into(),
+        lapin::types::AMQPValue::LongString("".into()),
+    );
+    args.insert(
+        "x-dead-letter-routing-key".into(),
+        lapin::types::AMQPValue::LongString("dead".into()),
+    );
+    ch.queue_declare("live".into(), QueueDeclareOptions::default(), args)
+        .await
+        .unwrap();
+    publish_to(&ch, "", "live", b"expires").await;
+    http(hp, "POST", "/chaos/queues/dl/live/expire").await;
+    let got = get_eventually(&ch, "dead")
+        .await
+        .expect("dead-lettered in the same vhost");
+    assert_eq!(got.data, b"expires");
+}
+
+#[tokio::test]
+async fn management_api_names_the_vhost_and_purges_by_it() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&on_vhost(&url, "ops")).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_durable(&ch, "work").await;
+    publish_to(&ch, "", "work", b"x").await;
+
+    let listing = http(hp, "GET", "/api/queues").await;
+    assert!(
+        listing.contains(r#""name":"work","vhost":"ops""#),
+        "{listing}"
+    );
+    assert!(http(hp, "GET", "/api/connections")
+        .await
+        .contains(r#""vhost":"ops""#));
+    assert!(http(hp, "GET", "/api/exchanges")
+        .await
+        .contains(r#""vhost":"ops""#));
+    // the wrong vhost does not find it
+    assert!(http(hp, "DELETE", "/api/queues/%2F/work/contents")
+        .await
+        .contains("404"));
+    assert!(http(hp, "DELETE", "/api/queues/ops/work/contents")
+        .await
+        .contains(r#""purged":1"#));
+}
+
+#[tokio::test]
+async fn vhosts_survive_a_restart_with_persistence() {
+    let path = format!(
+        "{}/persist-vhost-{}.db",
+        env!("CARGO_TARGET_TMPDIR"),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let start_on = |broker| async move {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(rabbit_sim::serve_amqp(l, broker, false));
+        (format!("amqp://127.0.0.1:{port}/%2f"), h)
+    };
+
+    let b1 = rabbit_sim::open_broker(&path).unwrap();
+    let (url, h1) = start_on(b1.clone()).await;
+    for (vhost, body) in [("%2f", &b"root"[..]), ("t1", b"one"), ("t2", b"two")] {
+        let conn = connect(&on_vhost(&url, vhost)).await;
+        let ch = conn.create_channel().await.unwrap();
+        declare_durable(&ch, "q").await;
+        ch.basic_publish(
+            "".into(),
+            "q".into(),
+            BasicPublishOptions::default(),
+            body,
+            BasicProperties::default().with_delivery_mode(2),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    }
+    h1.abort();
+    drop(b1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let b2 = rabbit_sim::open_broker(&path).unwrap();
+    let (url, _h2) = start_on(b2).await;
+    for (vhost, body) in [("%2f", &b"root"[..]), ("t1", b"one"), ("t2", b"two")] {
+        let conn = connect(&on_vhost(&url, vhost)).await;
+        let ch = conn.create_channel().await.unwrap();
+        let got = get_eventually(&ch, "q").await.expect(vhost);
+        assert_eq!(got.data, body, "vhost {vhost}");
+        assert!(ch
+            .basic_get("q".into(), BasicGetOptions::default())
+            .await
+            .unwrap()
+            .is_none());
+    }
+    let _ = std::fs::remove_file(&path);
+}
