@@ -33,6 +33,8 @@ pub struct Entry {
     /// Times returned to the queue (only counted on quorum queues).
     delivery_count: u32,
     expires_at: Option<Instant>,
+    /// When a delayed message (`x-opt-delivery-time` on a quorum queue) becomes ready. Only set while it is held.
+    ready_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
@@ -66,6 +68,25 @@ fn int_of(v: &Value) -> Option<i64> {
         Value::I64(x) => Some(*x),
         _ => None,
     }
+}
+
+/// When a message with an `x-opt-delivery-time` header (milliseconds since the Unix epoch) is due, on the broker's clock,
+/// or None if it has none or is already due. Only RabbitMQ 4.4 and later, which `--rabbitmq 4` emulates, honour it.
+fn delivery_delay(headers: &Table, major: u8, now: Instant) -> Option<Instant> {
+    if major < 4 {
+        return None;
+    }
+    let want = headers
+        .iter()
+        .find(|(k, _)| k == "x-opt-delivery-time")
+        .and_then(|(_, v)| int_of(v))?;
+    let epoch_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    // `now` already includes the clock skew, so shift the epoch the same way.
+    let skew = now.saturating_duration_since(Instant::now()).as_millis() as i64;
+    let wait = want - (epoch_now + skew);
+    (wait > 0).then(|| now + Duration::from_millis(wait as u64))
 }
 
 fn str_of(v: &Value) -> Option<String> {
@@ -253,6 +274,8 @@ pub struct Consumer {
 }
 
 pub struct Queue {
+    /// Delayed messages waiting for their delivery time. They count toward the length limit but are not ready.
+    held: Vec<Entry>,
     durable: bool,
     exclusive: Option<ConnId>,
     auto_delete: bool,
@@ -471,6 +494,16 @@ fn headers_match(args: &Table, hdr: &Table) -> bool {
 impl Broker {
     /// Emulate the stricter behaviour of a RabbitMQ major version. At 4, declaring a transient queue that is not
     /// exclusive is refused, as RabbitMQ 4 does unless `transient_nonexcl_queues` is permitted.
+    /// The RabbitMQ version this broker reports to clients: 4.4.0 with `--rabbitmq 4`, which includes delayed messages on
+    /// quorum queues, and 3.13.7 otherwise, which does not.
+    pub fn emulated_version(&self) -> &'static str {
+        if self.rabbitmq_major >= 4 {
+            "4.4.0"
+        } else {
+            "3.13.7"
+        }
+    }
+
     pub fn set_rabbitmq_major(&mut self, major: u8) {
         self.rabbitmq_major = major;
     }
@@ -594,6 +627,7 @@ impl Broker {
             b.queues.insert(
                 name,
                 Queue {
+                    held: vec![],
                     durable: true,
                     exclusive: None,
                     auto_delete,
@@ -645,13 +679,29 @@ impl Broker {
                 persistent: true,
                 ttl_ms,
             });
-            q.msgs.push_back(Entry {
+            let now = Instant::now() + b.clock_skew;
+            let ready_at = if q.cfg.quorum {
+                delivery_delay(&msg.headers, b.rabbitmq_major, now)
+            } else {
+                None
+            };
+            let entry = Entry {
                 msg,
                 redelivered: false,
                 id: m.id,
                 delivery_count: 0,
-                expires_at: ttl.map(|t| Instant::now() + Duration::from_millis(t)),
-            });
+                expires_at: if ready_at.is_some() {
+                    None
+                } else {
+                    ttl.map(|t| Instant::now() + Duration::from_millis(t))
+                },
+                ready_at,
+            };
+            if ready_at.is_some() {
+                q.held.push(entry);
+            } else {
+                q.msgs.push_back(entry);
+            }
         }
         b.store = Some(store);
         b.storage = Some(path.to_string());
@@ -1042,6 +1092,7 @@ impl Broker {
         self.queues.insert(
             name.clone(),
             Queue {
+                held: vec![],
                 durable,
                 exclusive: exclusive.then_some(conn),
                 auto_delete,
@@ -1325,6 +1376,7 @@ impl Broker {
 
     /// Hand queued messages to eligible consumers, round-robin, honoring prefetch.
     pub fn dispatch(&mut self, qn: &str) {
+        self.release_held(qn);
         self.dispatch_inner(qn);
         self.expire_head(qn);
     }
@@ -1393,6 +1445,7 @@ impl Broker {
 
     pub fn get(&mut self, conn: ConnId, ch: u16, queue: &str, no_ack: bool) -> Res<()> {
         self.check_queue(conn, queue)?;
+        self.release_held(queue);
         self.expire_head(queue);
         let q = self.queues.get_mut(queue).unwrap();
         let Some(entry) = q.msgs.pop_front() else {
@@ -1518,7 +1571,7 @@ impl Broker {
         };
         let mut victim = None;
         if let Some(max) = q.cfg.max_length {
-            if q.msgs.len() >= max {
+            if q.msgs.len() + q.held.len() >= max {
                 if q.cfg.overflow == Overflow::DropHead {
                     victim = q.msgs.pop_front();
                 } else {
@@ -1539,13 +1592,29 @@ impl Broker {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        q.msgs.push_back(Entry {
+        // A delayed message is routed and confirmed now but only becomes ready at its delivery time. Only quorum queues hold it.
+        let ready_at = if q.cfg.quorum {
+            delivery_delay(&msg.headers, self.rabbitmq_major, now)
+        } else {
+            None
+        };
+        let entry = Entry {
             msg: msg.clone(),
             redelivered: false,
             id,
             delivery_count: 0,
-            expires_at: ttl.map(|t| now + Duration::from_millis(t)),
-        });
+            expires_at: if ready_at.is_some() {
+                None
+            } else {
+                ttl.map(|t| now + Duration::from_millis(t))
+            },
+            ready_at,
+        };
+        if ready_at.is_some() {
+            q.held.push(entry);
+        } else {
+            q.msgs.push_back(entry);
+        }
         if id != 0 {
             self.persist(|| Op::Enqueue {
                 id,
@@ -1722,10 +1791,79 @@ impl Broker {
         }
     }
 
-    /// Chaos: move the TTL clock forward and expire whatever is now due.
+    /// Move delayed messages whose delivery time has come into the queue, oldest first.
+    fn release_held(&mut self, qn: &str) {
+        let now = Instant::now() + self.clock_skew;
+        let Some(q) = self.queues.get_mut(qn) else {
+            return;
+        };
+        if q.held.is_empty() {
+            return;
+        }
+        let mut due: Vec<Entry> = Vec::new();
+        let mut i = 0;
+        while i < q.held.len() {
+            if q.held[i].ready_at.is_some_and(|t| t <= now) {
+                due.push(q.held.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        due.sort_by_key(|e| e.ready_at);
+        for mut e in due {
+            // A queue TTL starts when the message becomes ready.
+            let ttl = match (q.cfg.ttl_ms, e.msg.ttl_ms) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            e.expires_at = ttl.map(|t| now + Duration::from_millis(t));
+            e.ready_at = None;
+            q.msgs.push_back(e);
+        }
+    }
+
+    /// The earliest time anything is due: the head of a queue expiring, or a delayed message becoming ready.
+    fn next_due(&self) -> Option<Instant> {
+        let mut best: Option<Instant> = None;
+        let mut note = |t: Instant| best = Some(best.map_or(t, |b| b.min(t)));
+        for q in self.queues.values() {
+            if let Some(t) = q.msgs.front().and_then(|e| e.expires_at) {
+                note(t);
+            }
+            for t in q.held.iter().filter_map(|e| e.ready_at) {
+                note(t);
+            }
+        }
+        best
+    }
+
+    /// Chaos: move the clock forward by `ms` and let everything due in that time happen, in order. A message that expires in one
+    /// queue and is dead-lettered into another, as in a chain of delay queues, goes on from the moment it expired, so one call can
+    /// carry it through every hop that fits in `ms`.
     pub fn advance_clock(&mut self, ms: u64) {
-        self.clock_skew += Duration::from_millis(ms);
+        let target = self.clock_skew + Duration::from_millis(ms);
+        for _ in 0..1_000_000 {
+            let Some(due) = self.next_due() else { break };
+            if due > Instant::now() + target {
+                break;
+            }
+            // Step the clock to the moment this is due, never backwards, then let it happen.
+            let step = due.saturating_duration_since(Instant::now());
+            let before = self.clock_skew;
+            self.clock_skew = self.clock_skew.max(step);
+            self.sweep();
+            if self.clock_skew == before && self.next_due() == Some(due) {
+                break; // nothing changed, so stop rather than loop
+            }
+        }
+        self.clock_skew = self.clock_skew.max(target);
         self.sweep();
+    }
+
+    /// Chaos: put the clock back to real time, undoing every advance. Messages due on the advanced clock but not on the real
+    /// one wait again.
+    pub fn reset_clock(&mut self) {
+        self.clock_skew = Duration::ZERO;
     }
 
     /// Chaos: expire every ready message in a queue right now (dead-lettering if configured).
@@ -1746,11 +1884,14 @@ impl Broker {
         let names: Vec<String> = self
             .queues
             .iter()
-            .filter(|(_, q)| q.msgs.front().is_some_and(|e| e.expires_at.is_some()))
+            .filter(|(_, q)| {
+                !q.held.is_empty() || q.msgs.front().is_some_and(|e| e.expires_at.is_some())
+            })
             .map(|(n, _)| n.clone())
             .collect();
         for n in names {
-            self.expire_head(&n);
+            // `dispatch` releases delayed messages that are due, delivers them, and expires the head.
+            self.dispatch(&n);
         }
     }
 }
@@ -1795,13 +1936,14 @@ impl Broker {
             .map(|n| {
                 let q = &self.queues[n];
                 format!(
-                    "{{\"name\":{},\"vhost\":{},\"durable\":{},\"auto_delete\":{},\"exclusive\":{},\"messages_ready\":{},\"messages_unacknowledged\":{},\"consumers\":{}}}",
+                    "{{\"name\":{},\"vhost\":{},\"durable\":{},\"auto_delete\":{},\"exclusive\":{},\"messages_ready\":{},\"messages_delayed\":{},\"messages_unacknowledged\":{},\"consumers\":{}}}",
                     esc(local_name(n)),
                     esc(vhost_of(n)),
                     q.durable,
                     q.auto_delete,
                     q.exclusive.is_some(),
                     q.msgs.len(),
+                    q.held.len(),
                     unacked.get(n.as_str()).copied().unwrap_or(0),
                     q.consumers.len()
                 )

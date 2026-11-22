@@ -95,6 +95,8 @@ and change nothing. The same delays can be set at start-up with `--confirm-delay
 
 All of them use real time.
 
+Delayed delivery can be tested without waiting. With `--rabbitmq 4` a message with an `x-opt-delivery-time` header (milliseconds since the epoch) waits on a **quorum** queue until its time, as in RabbitMQ 4.4 (classic queues and `--rabbitmq 3` ignore the header). Held messages show as `messages_delayed` in `GET /api/queues`. `POST /chaos/clock/advance?ms=N` releases them (and `POST /chaos/clock/reset` puts the clock back, which a test should do, because the clock is shared and absolute delivery times follow it), and it also carries a message through a whole chain of TTL and dead-letter queues in one call, hop by hop in order, which is how delays are built on older brokers. With `--rabbitmq 4` the broker reports itself as 4.4.0, and as 3.13.7 otherwise. Its own version is the `rabbit_sim_version` server property. See the book chapter "Testing delayed messages".
+
 ## Version behaviour
 rabbit-sim is not a particular RabbitMQ release. With `--rabbitmq 4` it refuses what RabbitMQ 4 refuses by default, so a test that would fail there fails here too. Today that is declaring a transient (non-durable) queue that is not exclusive, which RabbitMQ 4 rejects with `INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated` and a connection close. The default, `--rabbitmq 3`, accepts such queues. Run against both settings, and still check a real broker before a release.
 

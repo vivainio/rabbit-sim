@@ -43,7 +43,7 @@ async function refresh() {
     document.getElementById('storage').textContent = o.storage ? 'persisted: ' + o.storage : 'in-memory';
     document.getElementById('cards').innerHTML = [['connections','Connections'],['channels','Channels'],['queues','Queues'],['exchanges','Exchanges'],['consumers','Consumers'],['messages_ready','Ready'],['messages_unacknowledged','Unacked']]
       .map(([k, l]) => `<div class="card"><b>${o[k]}</b><span>${l}</span></div>`).join('');
-    table('queues', [['vhost','Vhost'],['name','Name'],['messages_ready','Ready','n'],['messages_unacknowledged','Unacked','n'],['consumers','Consumers','n'],['durable','Durable'],['auto_delete','Auto-delete'],['exclusive','Exclusive']], q,
+    table('queues', [['vhost','Vhost'],['name','Name'],['messages_ready','Ready','n'],['messages_delayed','Delayed','n'],['messages_unacknowledged','Unacked','n'],['consumers','Consumers','n'],['durable','Durable'],['auto_delete','Auto-delete'],['exclusive','Exclusive']], q,
       r => `<button data-v="${esc(r.vhost)}" data-q="${esc(r.name)}">purge</button>`);
     document.querySelectorAll('button[data-q]').forEach(b => b.onclick = () => purge(b.dataset.v, b.dataset.q));
     table('exchanges', [['vhost','Vhost'],['name','Name'],['type','Type'],['durable','Durable'],['auto_delete','Auto-delete'],['bindings','Bindings','n']], e);

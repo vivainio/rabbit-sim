@@ -12,4 +12,5 @@ It is not RabbitMQ. It behaves like RabbitMQ where tests usually look, and it ad
 - [What it leaves out](omissions.md) lists what is not emulated.
 - [Fault injection](fault-injection.md) is the reference for `POST /chaos`, the TTL clock and the start-up flags.
 - [Testing slow brokers](testing-slow-brokers.md) shows what to test with those faults: prefetch, concurrency, slow consumers and redelivery.
+- [Testing delayed messages](testing-delayed-messages.md) covers delayed delivery and timeouts: native delayed messages and chains of delay queues.
 - [Building and releasing](development.md) covers the tests and the release steps.

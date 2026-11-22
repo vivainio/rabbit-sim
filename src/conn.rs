@@ -20,7 +20,7 @@ fn bad(msg: &str) -> io::Error {
     io::Error::other(msg.to_string())
 }
 
-fn server_properties() -> Table {
+fn server_properties(version: &str) -> Table {
     let s = |v: &str| Value::Str(v.as_bytes().to_vec());
     let caps: Table = [
         "publisher_confirms",
@@ -33,7 +33,8 @@ fn server_properties() -> Table {
     .collect();
     vec![
         ("product".into(), s("RabbitSim")),
-        ("version".into(), s(env!("CARGO_PKG_VERSION"))),
+        ("version".into(), s(version)),
+        ("rabbit_sim_version".into(), s(env!("CARGO_PKG_VERSION"))),
         ("platform".into(), s("Rust")),
         ("capabilities".into(), Value::Table(caps)),
     ]
@@ -80,10 +81,11 @@ pub async fn serve(sock: TcpStream, broker: Shared, verbose: bool) -> io::Result
     }
 
     // connection.start
+    let props = server_properties(broker.lock().unwrap().emulated_version());
     wr.write_all(&method(0, 10, 10, |w| {
         w.u8(0);
         w.u8(9);
-        w.table(&server_properties());
+        w.table(&props);
         w.long(b"PLAIN AMQPLAIN");
         w.long(b"en_US");
     }))

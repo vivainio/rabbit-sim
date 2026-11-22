@@ -20,6 +20,7 @@ nav = [
   { "Testing with faults" = [
     { "Fault injection" = "fault-injection.md" },
     { "Testing slow brokers" = "testing-slow-brokers.md" },
+    { "Testing delayed messages" = "testing-delayed-messages.md" },
   ] },
   { "Development" = [
     { "Building and releasing" = "development.md" },

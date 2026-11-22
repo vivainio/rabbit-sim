@@ -104,6 +104,11 @@ fn route(method: &str, path: &str, body: &str, broker: &Shared) -> Vec<u8> {
                 &format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
             ),
         },
+        // POST /chaos/clock/reset -> put the clock back to real time, undoing every advance
+        ("POST", "/chaos/clock/reset") => {
+            broker.lock().unwrap().reset_clock();
+            json("{\"advanced_ms\":0}")
+        }
         // POST /chaos/queues/{vhost}/{name}/expire -> expire all ready messages now
         ("POST", p) if p.starts_with("/chaos/queues/") && p.ends_with("/expire") => {
             let mid = &p["/chaos/queues/".len()..p.len() - "/expire".len()];

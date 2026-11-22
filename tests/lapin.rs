@@ -1919,3 +1919,298 @@ async fn vhosts_survive_a_restart_with_persistence() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn consumers_receive_deliveries_on_a_vhost() {
+    let (url, _hp) = start_with_http().await;
+    let conn = connect(&on_vhost(&url, "cv")).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_durable(&ch, "work").await;
+    ch.basic_qos(4, BasicQosOptions::default()).await.unwrap();
+    let mut cons = ch
+        .basic_consume(
+            "work".into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    publish_to(&ch, "", "work", b"pushed").await;
+    let d = tokio::time::timeout(Duration::from_secs(3), cons.next())
+        .await
+        .expect("a delivery on the vhost")
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.data, b"pushed");
+    d.ack(BasicAckOptions::default()).await.unwrap();
+    // a message published before the consumer exists is delivered when it arrives
+    publish_to(&ch, "", "work", b"waiting").await;
+    let d = tokio::time::timeout(Duration::from_secs(3), cons.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.data, b"waiting");
+}
+
+async fn start_emulating_with_http(major: u8) -> (String, u16) {
+    let amqp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ap, hp) = (
+        amqp.local_addr().unwrap().port(),
+        hl.local_addr().unwrap().port(),
+    );
+    let broker = rabbit_sim::new_broker();
+    broker.lock().unwrap().set_rabbitmq_major(major);
+    tokio::spawn(rabbit_sim::serve_amqp(amqp, broker.clone(), false));
+    tokio::spawn(rabbit_sim::serve_http(hl, broker));
+    (format!("amqp://127.0.0.1:{ap}/%2f"), hp)
+}
+
+fn epoch_ms_in(millis: i64) -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + millis
+}
+
+async fn publish_due(ch: &lapin::Channel, queue: &str, body: &[u8], due_epoch_ms: i64) {
+    let mut headers = FieldTable::default();
+    headers.insert(
+        "x-opt-delivery-time".into(),
+        lapin::types::AMQPValue::LongLongInt(due_epoch_ms),
+    );
+    ch.basic_publish(
+        "".into(),
+        queue.into(),
+        BasicPublishOptions::default(),
+        body,
+        BasicProperties::default()
+            .with_delivery_mode(2)
+            .with_headers(headers),
+    )
+    .await
+    .unwrap()
+    .await
+    .unwrap();
+}
+
+async fn declare_typed(ch: &lapin::Channel, q: &str, queue_type: &str) {
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-queue-type".into(),
+        lapin::types::AMQPValue::LongString(queue_type.into()),
+    );
+    ch.queue_declare(
+        q.into(),
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        args,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn delayed_messages_wait_on_quorum_queues_until_the_clock_reaches_them() {
+    let (url, hp) = start_emulating_with_http(4).await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_typed(&ch, "later", "quorum").await;
+    declare_typed(&ch, "classic-later", "classic").await;
+
+    publish_due(&ch, "later", b"in a minute", epoch_ms_in(60_000)).await;
+    publish_due(&ch, "later", b"in two minutes", epoch_ms_in(120_000)).await;
+    publish_due(&ch, "later", b"already due", epoch_ms_in(-1_000)).await;
+    publish_due(
+        &ch,
+        "classic-later",
+        b"classic ignores it",
+        epoch_ms_in(60_000),
+    )
+    .await;
+
+    // routed and confirmed at once, but only the due one is ready
+    assert_eq!(
+        get_eventually(&ch, "later").await.unwrap().data,
+        b"already due"
+    );
+    assert!(ch
+        .basic_get("later".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    // a classic queue does not hold it, as on a real broker
+    assert_eq!(
+        get_eventually(&ch, "classic-later").await.unwrap().data,
+        b"classic ignores it"
+    );
+    // the held ones show in the management API
+    let listing = http(hp, "GET", "/api/queues").await;
+    assert!(
+        listing.contains(r#""name":"later""#) && listing.contains(r#""messages_delayed":2"#),
+        "{listing}"
+    );
+
+    http(hp, "POST", "/chaos/clock/advance?ms=61000").await;
+    assert_eq!(
+        get_eventually(&ch, "later").await.unwrap().data,
+        b"in a minute"
+    );
+    assert!(ch
+        .basic_get("later".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    http(hp, "POST", "/chaos/clock/advance?ms=60000").await;
+    assert_eq!(
+        get_eventually(&ch, "later").await.unwrap().data,
+        b"in two minutes"
+    );
+}
+
+#[tokio::test]
+async fn delayed_messages_are_delivered_to_a_waiting_consumer_and_older_brokers_ignore_the_header()
+{
+    let (url, hp) = start_emulating_with_http(4).await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_typed(&ch, "pushed", "quorum").await;
+    let mut cons = ch
+        .basic_consume(
+            "pushed".into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    publish_due(&ch, "pushed", b"timed", epoch_ms_in(30_000)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), cons.next())
+            .await
+            .is_err()
+    );
+    http(hp, "POST", "/chaos/clock/advance?ms=31000").await;
+    let d = tokio::time::timeout(Duration::from_secs(3), cons.next())
+        .await
+        .expect("delivered once due")
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.data, b"timed");
+
+    // RabbitMQ 3.x and 4.0-4.3 have no such feature: the header is just a header and the message is ready at once
+    let old = start_emulating(3).await;
+    let conn = connect(&old).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_typed(&ch, "q", "quorum").await;
+    publish_due(&ch, "q", b"no delay here", epoch_ms_in(60_000)).await;
+    assert_eq!(
+        get_eventually(&ch, "q").await.unwrap().data,
+        b"no delay here"
+    );
+}
+
+// A chain of queues with fixed TTLs and dead-letter exchanges, the way a delay-level topology is built.
+async fn declare_hop(
+    ch: &lapin::Channel,
+    queue: &str,
+    ttl_ms: u32,
+    next_exchange: &str,
+    next_key: &str,
+) {
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-message-ttl".into(),
+        lapin::types::AMQPValue::LongUInt(ttl_ms),
+    );
+    args.insert(
+        "x-dead-letter-exchange".into(),
+        lapin::types::AMQPValue::LongString(next_exchange.into()),
+    );
+    args.insert(
+        "x-dead-letter-routing-key".into(),
+        lapin::types::AMQPValue::LongString(next_key.into()),
+    );
+    ch.queue_declare(
+        queue.into(),
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        args,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn one_clock_advance_carries_a_message_through_every_hop_of_a_delay_chain() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    // hop4 (4 s) -> hop2 (2 s) -> hop1 (1 s) -> final, each handing on by the default exchange
+    declare_durable(&ch, "final").await;
+    declare_hop(&ch, "hop1", 1000, "", "final").await;
+    declare_hop(&ch, "hop2", 2000, "", "hop1").await;
+    declare_hop(&ch, "hop4", 4000, "", "hop2").await;
+    publish_to(&ch, "", "hop4", b"seven seconds").await;
+
+    // 3.5 s is not yet hop4's 4 s, so nothing has moved on
+    http(hp, "POST", "/chaos/clock/advance?ms=3500").await;
+    assert!(ch
+        .basic_get("final".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    // another 3.5 s makes 7 s in all: 4 + 2 + 1, with each hop starting when the one before it expired
+    http(hp, "POST", "/chaos/clock/advance?ms=3500").await;
+    assert_eq!(
+        get_eventually(&ch, "final").await.unwrap().data,
+        b"seven seconds"
+    );
+}
+
+#[tokio::test]
+async fn a_single_large_advance_passes_all_the_hops_at_once() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_durable(&ch, "final").await;
+    declare_hop(&ch, "hop1", 1000, "", "final").await;
+    declare_hop(&ch, "hop2", 2000, "", "hop1").await;
+    declare_hop(&ch, "hop4", 4000, "", "hop2").await;
+    publish_to(&ch, "", "hop4", b"at once").await;
+    http(hp, "POST", "/chaos/clock/advance?ms=7000").await;
+    assert_eq!(get_eventually(&ch, "final").await.unwrap().data, b"at once");
+}
+
+#[tokio::test]
+async fn advancing_the_clock_moves_delivery_times_too_and_reset_puts_it_back() {
+    let (url, hp) = start_emulating_with_http(4).await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_typed(&ch, "dq", "quorum").await;
+
+    // after an advance, a time that is still ahead on the real clock is already past on the broker's
+    http(hp, "POST", "/chaos/clock/advance?ms=10000").await;
+    publish_due(&ch, "dq", b"looks due", epoch_ms_in(5_000)).await;
+    assert_eq!(get_eventually(&ch, "dq").await.unwrap().data, b"looks due");
+
+    // reset undoes it, so the same time is in the future again and the message waits
+    assert!(http(hp, "POST", "/chaos/clock/reset")
+        .await
+        .contains(r#""advanced_ms":0"#));
+    publish_due(&ch, "dq", b"waits", epoch_ms_in(60_000)).await;
+    assert!(ch
+        .basic_get("dq".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+    http(hp, "POST", "/chaos/clock/advance?ms=61000").await;
+    assert_eq!(get_eventually(&ch, "dq").await.unwrap().data, b"waits");
+}

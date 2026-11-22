@@ -30,7 +30,12 @@ Time-dependent behaviour is slow to test, so the broker's TTL clock can be drive
 
 ```text
 POST /chaos/clock/advance?ms=3600000          # move the TTL clock forward and expire what is due
+POST /chaos/clock/reset                       # put the clock back to real time
 POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now (%2F is the vhost)
 ```
 
-Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock. Heartbeats and everything else run on real time.
+Expired messages are dead-lettered exactly as real expiry would. Only message TTLs and delayed messages use this clock. Heartbeats and everything else run on real time.
+
+`clock/advance` lets everything due in that time happen, in order, as if the time had passed. A message that expires in one queue and is dead-lettered into another carries on from the moment it expired. So one advance of 10 seconds takes a message through a chain of delay queues that adds up to 10 seconds, with no need to step through them one hop at a time. See [testing delayed messages](testing-delayed-messages.md).
+
+The clock is one for the whole broker and an advance stays until it is reset. That matters for absolute delivery times as well as for TTLs: after an advance of ten seconds, a delivery time five seconds ahead on the real clock is already past on the broker's. A test that advances the clock should call `clock/reset` when it finishes, or the tests after it will see messages delivered early.
