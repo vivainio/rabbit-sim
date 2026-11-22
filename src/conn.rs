@@ -601,10 +601,21 @@ impl Conn {
             (60, 80) => {
                 let tag = r.u64()?;
                 let multiple = r.u8()? & 1 != 0;
-                self.broker
-                    .lock()
-                    .unwrap()
-                    .settle(self.id, ch, tag, multiple, None)?;
+                let due = self.broker.lock().unwrap().ack_due();
+                match due {
+                    None => self
+                        .broker
+                        .lock()
+                        .unwrap()
+                        .settle(self.id, ch, tag, multiple, None)?,
+                    Some(due) => {
+                        let (broker, id) = (self.broker.clone(), self.id);
+                        tokio::spawn(async move {
+                            tokio::time::sleep_until(due).await;
+                            broker.lock().unwrap().settle_late(id, ch, tag, multiple);
+                        });
+                    }
+                }
             }
             (60, 90) => {
                 let tag = r.u64()?;

@@ -1,8 +1,9 @@
 //! Minimal management HTTP server: JSON API plus a single embedded HTML page.
 
+use crate::broker::Chaos;
 use crate::conn::Shared;
 use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 const UI: &str = include_str!("ui.html");
@@ -40,7 +41,7 @@ fn json(body: &str) -> Vec<u8> {
     respond("200 OK", "application/json", body)
 }
 
-fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
+fn route(method: &str, path: &str, body: &str, broker: &Shared) -> Vec<u8> {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let path = path.trim_end_matches('/');
     let param = |k: &str| {
@@ -81,31 +82,20 @@ fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
                 "{\"error\":\"expected ?ms=<milliseconds>\"}",
             ),
         },
-        // POST /chaos/latency?confirm=MS -> hold every publisher confirm back by MS milliseconds (0 confirms at once)
-        ("POST", "/chaos/latency") => match param("confirm").and_then(|v| v.parse::<u64>().ok()) {
-            Some(ms) => {
-                broker
-                    .lock()
-                    .unwrap()
-                    .set_confirm_delay(std::time::Duration::from_millis(ms));
-                json(&format!("{{\"confirm_delay_ms\":{ms}}}"))
+        // GET /chaos -> the fault-injection settings in force
+        ("GET", "/chaos") => json(&broker.lock().unwrap().chaos().to_json()),
+        // POST /chaos {"confirm_delay_ms":0,"deliver_delay_ms":0,"ack_delay_ms":0,"nack_next":0}
+        // -> replace all fault-injection settings; fields left out are 0, so {} turns everything off
+        ("POST", "/chaos") => match Chaos::from_json(body) {
+            Ok(c) => {
+                let mut br = broker.lock().unwrap();
+                br.set_chaos(c);
+                json(&br.chaos().to_json())
             }
-            None => respond(
+            Err(e) => respond(
                 "400 Bad Request",
                 "application/json",
-                "{\"error\":\"expected ?confirm=<milliseconds>\"}",
-            ),
-        },
-        // POST /chaos/nack?count=N -> decline the next N publishes on confirm channels: dropped, answered with basic.nack
-        ("POST", "/chaos/nack") => match param("count").and_then(|v| v.parse::<u32>().ok()) {
-            Some(count) => {
-                broker.lock().unwrap().nack_next_publishes(count);
-                json(&format!("{{\"nack_next\":{count}}}"))
-            }
-            None => respond(
-                "400 Bad Request",
-                "application/json",
-                "{\"error\":\"expected ?count=<number>\"}",
+                &format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
             ),
         },
         // POST /chaos/queues/{vhost}/{name}/expire -> expire all ready messages now
@@ -137,13 +127,22 @@ pub async fn serve(sock: TcpStream, broker: Shared) -> io::Result<()> {
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let (method, path) = (method.to_string(), path.to_string());
-    // drain headers
+    // read headers, keeping the body length
+    let mut length = 0usize;
     loop {
         let mut h = String::new();
         if rd.read_line(&mut h).await? == 0 || h == "\r\n" || h == "\n" {
             break;
         }
+        if let Some((name, value)) = h.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap_or(0).min(65536);
+            }
+        }
     }
-    wr.write_all(&route(&method, &path, &broker)).await?;
+    let mut body = vec![0u8; length];
+    rd.read_exact(&mut body).await?;
+    let body = String::from_utf8_lossy(&body);
+    wr.write_all(&route(&method, &path, &body, &broker)).await?;
     wr.shutdown().await
 }

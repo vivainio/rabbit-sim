@@ -490,13 +490,23 @@ async fn headers_exchange_and_errors() {
 }
 
 async fn http(port: u16, method: &str, path: &str) -> String {
+    http_body(port, method, path, "").await
+}
+
+async fn http_body(port: u16, method: &str, path: &str, body: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
-    s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
+    s.write_all(
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
     let mut out = String::new();
     s.read_to_string(&mut out).await.unwrap();
     out
@@ -1413,9 +1423,11 @@ async fn confirm_delay_holds_confirms_back_in_order() {
     publish_confirmed(&ch, "q", b"fast").await;
     assert!(started.elapsed() < Duration::from_millis(100));
 
-    assert!(http(hp, "POST", "/chaos/latency?confirm=200")
-        .await
-        .contains(r#""confirm_delay_ms":200"#));
+    assert!(
+        http_body(hp, "POST", "/chaos", r#"{"confirm_delay_ms":200}"#)
+            .await
+            .contains(r#""confirm_delay_ms":200"#)
+    );
     let started = std::time::Instant::now();
     publish_confirmed(&ch, "q", b"slow").await;
     assert!(
@@ -1453,13 +1465,15 @@ async fn confirm_delay_holds_confirms_back_in_order() {
     );
 
     // 0 turns it off again, and a bad request is refused
-    http(hp, "POST", "/chaos/latency?confirm=0").await;
+    http_body(hp, "POST", "/chaos", r#"{}"#).await;
     let started = std::time::Instant::now();
     publish_confirmed(&ch, "q", b"fast again").await;
     assert!(started.elapsed() < Duration::from_millis(100));
-    assert!(http(hp, "POST", "/chaos/latency?confirm=soon")
-        .await
-        .contains("expected"));
+    assert!(
+        http_body(hp, "POST", "/chaos", r#"{"confirm_delay_ms":"soon"}"#)
+            .await
+            .contains("non-negative")
+    );
 }
 
 #[tokio::test]
@@ -1478,7 +1492,7 @@ async fn nack_next_declines_publishes_without_enqueuing_them() {
     .await
     .unwrap();
 
-    assert!(http(hp, "POST", "/chaos/nack?count=2")
+    assert!(http_body(hp, "POST", "/chaos", r#"{"nack_next":2}"#)
         .await
         .contains(r#""nack_next":2"#));
     for body in [&b"declined 1"[..], b"declined 2"] {
@@ -1502,7 +1516,156 @@ async fn nack_next_declines_publishes_without_enqueuing_them() {
         .await
         .expect("the accepted message");
     assert_eq!(got.data, b"accepted");
-    assert!(http(hp, "POST", "/chaos/nack?count=x")
+    assert!(http_body(hp, "POST", "/chaos", r#"{"nack_next":-1}"#)
         .await
-        .contains("expected"));
+        .contains("non-negative"));
+}
+
+async fn declare_and_fill(ch: &lapin::Channel, q: &str, n: usize) {
+    ch.queue_declare(
+        q.into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+    for i in 0..n {
+        ch.basic_publish(
+            "".into(),
+            q.into(),
+            BasicPublishOptions::default(),
+            format!("m{i}").as_bytes(),
+            BasicProperties::default(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn deliver_delay_holds_deliveries_back_in_order() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_and_fill(&ch, "dq", 3).await;
+    assert!(
+        http_body(hp, "POST", "/chaos", r#"{"deliver_delay_ms":200}"#)
+            .await
+            .contains(r#""deliver_delay_ms":200"#)
+    );
+    let started = std::time::Instant::now();
+    let mut cons = ch
+        .basic_consume(
+            "dq".into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..3 {
+        let d = cons.next().await.unwrap().unwrap();
+        assert_eq!(d.data, format!("m{i}").as_bytes());
+        if i == 0 {
+            assert!(
+                started.elapsed() >= Duration::from_millis(180),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+        d.ack(BasicAckOptions::default()).await.unwrap();
+    }
+    // the three were handed out together, so they arrive after about one delay, not three
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn ack_delay_keeps_the_message_unacked_meanwhile() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    declare_and_fill(&ch, "aq", 2).await;
+    ch.basic_qos(1, BasicQosOptions::default()).await.unwrap();
+    assert!(http_body(hp, "POST", "/chaos", r#"{"ack_delay_ms":300}"#)
+        .await
+        .contains(r#""ack_delay_ms":300"#));
+    let mut cons = ch
+        .basic_consume(
+            "aq".into(),
+            "".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    let d1 = cons.next().await.unwrap().unwrap();
+    assert_eq!(d1.data, b"m0");
+    let acked = std::time::Instant::now();
+    d1.ack(BasicAckOptions::default()).await.unwrap();
+    // prefetch 1: the next message waits for the broker to act on the ack
+    let d2 = tokio::time::timeout(Duration::from_secs(5), cons.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(d2.data, b"m1");
+    assert!(
+        acked.elapsed() >= Duration::from_millis(270),
+        "{:?}",
+        acked.elapsed()
+    );
+    d2.ack(BasicAckOptions::default()).await.unwrap();
+    // an ack still pending when the channel closes is dropped quietly
+    ch.close(200, "bye".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ch2 = conn.create_channel().await.unwrap();
+    ch2.queue_declare(
+        "aq".into(),
+        QueueDeclareOptions {
+            passive: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn chaos_endpoint_replaces_all_settings_and_rejects_bad_bodies() {
+    let (_url, hp) = start_with_http().await;
+    let set = http_body(
+        hp,
+        "POST",
+        "/chaos",
+        r#"{"confirm_delay_ms": 5, "deliver_delay_ms": 6, "ack_delay_ms": 7, "nack_next": 8}"#,
+    )
+    .await;
+    assert!(set
+        .contains(r#"{"confirm_delay_ms":5,"deliver_delay_ms":6,"ack_delay_ms":7,"nack_next":8}"#));
+    assert!(http(hp, "GET", "/chaos")
+        .await
+        .contains(r#""ack_delay_ms":7"#));
+    // the body is the whole behaviour: what it leaves out goes back to 0
+    assert!(http_body(hp, "POST", "/chaos", r#"{"ack_delay_ms":9}"#)
+        .await
+        .contains(r#"{"confirm_delay_ms":0,"deliver_delay_ms":0,"ack_delay_ms":9,"nack_next":0}"#));
+    assert!(http_body(hp, "POST", "/chaos", "{}")
+        .await
+        .contains(r#""ack_delay_ms":0"#));
+    // bad bodies are refused and change nothing
+    http_body(hp, "POST", "/chaos", r#"{"ack_delay_ms":9}"#).await;
+    assert!(http(hp, "POST", "/chaos").await.contains("400"));
+    assert!(http_body(hp, "POST", "/chaos", r#"{"ack_delay":5}"#)
+        .await
+        .contains("unknown field"));
+    assert!(http(hp, "GET", "/chaos")
+        .await
+        .contains(r#""ack_delay_ms":9"#));
 }

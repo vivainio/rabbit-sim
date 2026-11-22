@@ -2,7 +2,7 @@ use tokio::net::TcpListener;
 
 const USAGE: &str = "rabbit-sim - in-memory AMQP 0-9-1 broker for local development
 
-USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [--rabbitmq 3|4] [--confirm-delay MS] [-v]
+USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [--rabbitmq 3|4] [--confirm-delay MS] [--deliver-delay MS] [--ack-delay MS] [-v]
 
   -b, --bind ADDR   address to listen on (default 127.0.0.1)
   -p, --port PORT   AMQP port (default 5672)
@@ -12,6 +12,10 @@ USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [
                     exclusive, as RabbitMQ 4 does by default (default 3, which accepts them)
   -c, --confirm-delay MS
                     hold every publisher confirm back by MS milliseconds, like a loaded broker (default 0)
+      --deliver-delay MS
+                    hold every delivery to a consumer back by MS milliseconds (default 0)
+      --ack-delay MS
+                    act on every consumer ack only MS milliseconds after it arrives (default 0)
   -v, --verbose     log connections and protocol errors
 ";
 
@@ -24,6 +28,8 @@ async fn main() {
     let mut verbose = false;
     let mut rabbitmq = 3u8;
     let mut confirm_delay = 0u64;
+    let mut deliver_delay = 0u64;
+    let mut ack_delay = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -41,6 +47,20 @@ async fn main() {
             },
             "-c" | "--confirm-delay" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
                 Some(ms) => confirm_delay = ms,
+                None => {
+                    eprint!("{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "--deliver-delay" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => deliver_delay = ms,
+                None => {
+                    eprint!("{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "--ack-delay" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => ack_delay = ms,
                 None => {
                     eprint!("{USAGE}");
                     std::process::exit(2);
@@ -81,6 +101,11 @@ async fn main() {
         .lock()
         .unwrap()
         .set_confirm_delay(std::time::Duration::from_millis(confirm_delay));
+    {
+        let mut b = broker.lock().unwrap();
+        b.set_deliver_delay(std::time::Duration::from_millis(deliver_delay));
+        b.set_ack_delay(std::time::Duration::from_millis(ack_delay));
+    }
     if http_port != "0" {
         let haddr = format!("{bind}:{http_port}");
         match TcpListener::bind(&haddr).await {

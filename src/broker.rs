@@ -297,6 +297,74 @@ pub struct Broker {
     nack_remaining: u32,
     /// When the last delayed confirm is due, so confirms leave in the order they were made.
     last_confirm_due: Option<tokio::time::Instant>,
+    /// How long each delivery to a consumer is held back. Zero delivers at once.
+    deliver_delay: Duration,
+    last_deliver_due: Option<tokio::time::Instant>,
+    /// How long a consumer's basic.ack waits before the broker acts on it. Zero acts at once.
+    ack_delay: Duration,
+    last_ack_due: Option<tokio::time::Instant>,
+}
+
+/// Fault-injection settings. The default injects nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Chaos {
+    /// Hold each publisher confirm back this long.
+    pub confirm_delay_ms: u64,
+    /// Hold each delivery to a consumer back this long.
+    pub deliver_delay_ms: u64,
+    /// Act on each consumer ack this long after it arrives.
+    pub ack_delay_ms: u64,
+    /// Decline this many further publishes on confirm channels.
+    pub nack_next: u32,
+}
+
+impl Chaos {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"confirm_delay_ms\":{},\"deliver_delay_ms\":{},\"ack_delay_ms\":{},\"nack_next\":{}}}",
+            self.confirm_delay_ms, self.deliver_delay_ms, self.ack_delay_ms, self.nack_next
+        )
+    }
+
+    /// Parse a flat JSON object of non-negative integers. Fields left out are 0, so `{}` turns everything off.
+    pub fn from_json(body: &str) -> Result<Chaos, String> {
+        let inner = body
+            .trim()
+            .strip_prefix('{')
+            .and_then(|b| b.strip_suffix('}'))
+            .ok_or("expected a JSON object such as {\"ack_delay_ms\":250}")?;
+        let mut c = Chaos::default();
+        for field in inner.split(',').filter(|f| !f.trim().is_empty()) {
+            let (key, value) = field.split_once(':').ok_or("expected \"name\": number")?;
+            let key = key.trim().trim_matches('"');
+            let value: u64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("{key} must be a non-negative integer"))?;
+            match key {
+                "confirm_delay_ms" => c.confirm_delay_ms = value,
+                "deliver_delay_ms" => c.deliver_delay_ms = value,
+                "ack_delay_ms" => c.ack_delay_ms = value,
+                "nack_next" => {
+                    c.nack_next = u32::try_from(value).map_err(|_| "nack_next is too large")?
+                }
+                _ => return Err(format!("unknown field {key}")),
+            }
+        }
+        Ok(c)
+    }
+}
+
+// Deadline `delay` from now, never earlier than one microsecond after `last`, so delayed items keep their order.
+fn next_due(delay: Duration, last: &mut Option<tokio::time::Instant>) -> tokio::time::Instant {
+    let mut due = tokio::time::Instant::now() + delay;
+    if let Some(l) = *last {
+        if due <= l {
+            due = l + Duration::from_micros(1);
+        }
+    }
+    *last = Some(due);
+    due
 }
 
 fn esc(s: &str) -> String {
@@ -384,6 +452,49 @@ impl Broker {
         self.confirm_delay = delay;
     }
 
+    /// Hold every delivery to a consumer back by `delay`. The message counts as unacked (and against prefetch) meanwhile.
+    pub fn set_deliver_delay(&mut self, delay: Duration) {
+        self.deliver_delay = delay;
+    }
+
+    /// Make the broker act on each basic.ack only after `delay`, like a slow link. The message stays unacked meanwhile.
+    pub fn set_ack_delay(&mut self, delay: Duration) {
+        self.ack_delay = delay;
+    }
+
+    /// When a basic.ack arriving now should take effect; None means at once.
+    pub fn ack_due(&mut self) -> Option<tokio::time::Instant> {
+        if self.ack_delay.is_zero() {
+            return None;
+        }
+        Some(next_due(self.ack_delay, &mut self.last_ack_due))
+    }
+
+    /// Apply a delayed ack. The channel may have closed in the meantime, which makes it a no-op.
+    pub fn settle_late(&mut self, conn: ConnId, ch: u16, tag: u64, multiple: bool) {
+        if self.chans.contains_key(&(conn, ch)) {
+            let _ = self.settle(conn, ch, tag, multiple, None);
+        }
+    }
+
+    /// The fault-injection settings now in force. `nack_next` is how many publishes are still to be declined.
+    pub fn chaos(&self) -> Chaos {
+        Chaos {
+            confirm_delay_ms: self.confirm_delay.as_millis() as u64,
+            deliver_delay_ms: self.deliver_delay.as_millis() as u64,
+            ack_delay_ms: self.ack_delay.as_millis() as u64,
+            nack_next: self.nack_remaining,
+        }
+    }
+
+    /// Replace all fault-injection settings at once.
+    pub fn set_chaos(&mut self, c: Chaos) {
+        self.confirm_delay = Duration::from_millis(c.confirm_delay_ms);
+        self.deliver_delay = Duration::from_millis(c.deliver_delay_ms);
+        self.ack_delay = Duration::from_millis(c.ack_delay_ms);
+        self.nack_remaining = c.nack_next;
+    }
+
     /// Decline the next `count` publishes on channels in confirm mode: the message is dropped and the broker answers basic.nack.
     pub fn nack_next_publishes(&mut self, count: u32) {
         self.nack_remaining = count;
@@ -398,14 +509,7 @@ impl Broker {
         let Some(tx) = self.conns.get(&conn).map(|c| c.tx.clone()) else {
             return;
         };
-        let now = tokio::time::Instant::now();
-        let mut due = now + self.confirm_delay;
-        if let Some(last) = self.last_confirm_due {
-            if due <= last {
-                due = last + Duration::from_micros(1);
-            }
-        }
-        self.last_confirm_due = Some(due);
+        let due = next_due(self.confirm_delay, &mut self.last_confirm_due);
         tokio::spawn(async move {
             tokio::time::sleep_until(due).await;
             let _ = tx.send(bytes);
@@ -1222,7 +1326,15 @@ impl Broker {
                 w.short(&msg.routing_key);
             });
             b.extend(content(ch, &out_props(&msg, count), &msg.body, frame_max));
-            self.send(conn, b);
+            if self.deliver_delay.is_zero() {
+                self.send(conn, b);
+            } else if let Some(tx) = self.conns.get(&conn).map(|c| c.tx.clone()) {
+                let due = next_due(self.deliver_delay, &mut self.last_deliver_due);
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(due).await;
+                    let _ = tx.send(b);
+                });
+            }
         }
     }
 

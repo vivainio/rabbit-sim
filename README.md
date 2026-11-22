@@ -71,15 +71,23 @@ Time-dependent behaviour is slow to test, so the broker's TTL clock can be drive
     POST /chaos/clock/advance?ms=3600000          # move the TTL clock forward and expire what is due
     POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now
 
-    POST /chaos/latency?confirm=MS                # hold every publisher confirm back by MS ms (0 turns it off)
-    POST /chaos/nack?count=N                      # decline the next N publishes on confirm channels
-
-Confirms are held back in order, so publishes made together are confirmed together after about one delay, and a client that waits for
-a confirm per message becomes visibly slow, as it does on a real broker. A declined publish is dropped and answered with `basic.nack`,
-which is how a test reaches the path where a publisher is not told its message was accepted. Both use real time.
-
 Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock;
 heartbeats and everything else run on real time.
+
+    GET  /chaos                                   # the settings in force
+    POST /chaos                                   # replace all of them with the JSON body, e.g.
+                                                  # {"confirm_delay_ms":0,"deliver_delay_ms":40,"ack_delay_ms":250,"nack_next":0}
+
+The body is the whole behaviour: a field it leaves out is 0, so `{}` turns every fault off. Unknown fields and non-integers are refused with 400
+and change nothing. The same delays can be set at start-up with `--confirm-delay`, `--deliver-delay` and `--ack-delay` (milliseconds).
+
+- `confirm_delay_ms` holds every publisher confirm back, in order, so publishes made together are confirmed together after about one delay.
+- `deliver_delay_ms` holds every delivery to a consumer back, in order. The message counts as unacked, and against prefetch, while it waits.
+- `ack_delay_ms` makes the broker act on each consumer ack only after the delay, so the message stays unacked, and holds a prefetch slot, meanwhile.
+- `nack_next` declines the next N publishes on confirm channels: each is dropped and answered with `basic.nack`, which is how a test reaches the path
+  where a publisher is not told its message was accepted. It counts down as publishes are declined.
+
+All of them use real time.
 
 ## Version behaviour
 rabbit-sim is not a particular RabbitMQ release. With `--rabbitmq 4` it refuses what RabbitMQ 4 refuses by default, so a test that would fail there fails here too. Today that is declaring a transient (non-durable) queue that is not exclusive, which RabbitMQ 4 rejects with `INTERNAL_ERROR - Feature `transient_nonexcl_queues` is deprecated` and a connection close. The default, `--rabbitmq 3`, accepts such queues. Run against both settings, and still check a real broker before a release.
