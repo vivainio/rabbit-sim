@@ -1360,3 +1360,149 @@ async fn rabbitmq_3_still_accepts_transient_queues() {
     .await
     .unwrap();
 }
+
+async fn start_with_http() -> (String, u16) {
+    let amqp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ap, hp) = (
+        amqp.local_addr().unwrap().port(),
+        hl.local_addr().unwrap().port(),
+    );
+    let broker = rabbit_sim::new_broker();
+    tokio::spawn(rabbit_sim::serve_amqp(amqp, broker.clone(), false));
+    tokio::spawn(rabbit_sim::serve_http(hl, broker));
+    (format!("amqp://127.0.0.1:{ap}/%2f"), hp)
+}
+
+async fn publish_confirmed(
+    ch: &lapin::Channel,
+    queue: &str,
+    body: &[u8],
+) -> lapin::publisher_confirm::Confirmation {
+    ch.basic_publish(
+        "".into(),
+        queue.into(),
+        BasicPublishOptions::default(),
+        body,
+        BasicProperties::default(),
+    )
+    .await
+    .unwrap()
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn confirm_delay_holds_confirms_back_in_order() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.confirm_select(ConfirmSelectOptions::default())
+        .await
+        .unwrap();
+    ch.queue_declare(
+        "q".into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+
+    // no delay: a confirm is immediate
+    let started = std::time::Instant::now();
+    publish_confirmed(&ch, "q", b"fast").await;
+    assert!(started.elapsed() < Duration::from_millis(100));
+
+    assert!(http(hp, "POST", "/chaos/latency?confirm=200")
+        .await
+        .contains(r#""confirm_delay_ms":200"#));
+    let started = std::time::Instant::now();
+    publish_confirmed(&ch, "q", b"slow").await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(180),
+        "the confirm was held back: {:?}",
+        started.elapsed()
+    );
+
+    // several publishes made together are all confirmed, in order, after about one delay
+    let mut pending = Vec::new();
+    let started = std::time::Instant::now();
+    for i in 0..5 {
+        pending.push(
+            ch.basic_publish(
+                "".into(),
+                "q".into(),
+                BasicPublishOptions::default(),
+                format!("m{i}").as_bytes(),
+                BasicProperties::default(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    for confirm in pending {
+        assert!(matches!(
+            confirm.await.unwrap(),
+            lapin::publisher_confirm::Confirmation::Ack(_)
+        ));
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "five publishes waited together, not one after another: {:?}",
+        started.elapsed()
+    );
+
+    // 0 turns it off again, and a bad request is refused
+    http(hp, "POST", "/chaos/latency?confirm=0").await;
+    let started = std::time::Instant::now();
+    publish_confirmed(&ch, "q", b"fast again").await;
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(http(hp, "POST", "/chaos/latency?confirm=soon")
+        .await
+        .contains("expected"));
+}
+
+#[tokio::test]
+async fn nack_next_declines_publishes_without_enqueuing_them() {
+    let (url, hp) = start_with_http().await;
+    let conn = connect(&url).await;
+    let ch = conn.create_channel().await.unwrap();
+    ch.confirm_select(ConfirmSelectOptions::default())
+        .await
+        .unwrap();
+    ch.queue_declare(
+        "q".into(),
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(http(hp, "POST", "/chaos/nack?count=2")
+        .await
+        .contains(r#""nack_next":2"#));
+    for body in [&b"declined 1"[..], b"declined 2"] {
+        assert!(matches!(
+            publish_confirmed(&ch, "q", body).await,
+            lapin::publisher_confirm::Confirmation::Nack(_)
+        ));
+    }
+    assert!(ch
+        .basic_get("q".into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .is_none());
+
+    // after the count runs out, publishes are accepted again
+    assert!(matches!(
+        publish_confirmed(&ch, "q", b"accepted").await,
+        lapin::publisher_confirm::Confirmation::Ack(_)
+    ));
+    let got = get_eventually(&ch, "q")
+        .await
+        .expect("the accepted message");
+    assert_eq!(got.data, b"accepted");
+    assert!(http(hp, "POST", "/chaos/nack?count=x")
+        .await
+        .contains("expected"));
+}

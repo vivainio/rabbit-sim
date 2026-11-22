@@ -2,7 +2,7 @@ use tokio::net::TcpListener;
 
 const USAGE: &str = "rabbit-sim - in-memory AMQP 0-9-1 broker for local development
 
-USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [--rabbitmq 3|4] [-v]
+USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [--rabbitmq 3|4] [--confirm-delay MS] [-v]
 
   -b, --bind ADDR   address to listen on (default 127.0.0.1)
   -p, --port PORT   AMQP port (default 5672)
@@ -10,6 +10,8 @@ USAGE: rabbit-sim [--bind ADDR] [--port PORT] [--http-port PORT] [--data FILE] [
   -d, --data FILE   persist durable state to a SQLite file (default: in-memory only)
   -r, --rabbitmq N  emulate RabbitMQ N's stricter behaviour: 4 refuses transient queues that are not
                     exclusive, as RabbitMQ 4 does by default (default 3, which accepts them)
+  -c, --confirm-delay MS
+                    hold every publisher confirm back by MS milliseconds, like a loaded broker (default 0)
   -v, --verbose     log connections and protocol errors
 ";
 
@@ -21,6 +23,7 @@ async fn main() {
     let mut data: Option<String> = None;
     let mut verbose = false;
     let mut rabbitmq = 3u8;
+    let mut confirm_delay = 0u64;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -32,6 +35,13 @@ async fn main() {
                 Some("3") => rabbitmq = 3,
                 Some("4") => rabbitmq = 4,
                 _ => {
+                    eprint!("{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "-c" | "--confirm-delay" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => confirm_delay = ms,
+                None => {
                     eprint!("{USAGE}");
                     std::process::exit(2);
                 }
@@ -67,6 +77,10 @@ async fn main() {
         },
     };
     broker.lock().unwrap().set_rabbitmq_major(rabbitmq);
+    broker
+        .lock()
+        .unwrap()
+        .set_confirm_delay(std::time::Duration::from_millis(confirm_delay));
     if http_port != "0" {
         let haddr = format!("{bind}:{http_port}");
         match TcpListener::bind(&haddr).await {

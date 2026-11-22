@@ -291,6 +291,12 @@ pub struct Broker {
     clock_skew: Duration,
     /// RabbitMQ major version whose stricter behaviour is emulated (0 or 3 = permissive, 4 = RabbitMQ 4).
     rabbitmq_major: u8,
+    /// How long each publisher confirm is held back. Zero confirms at once.
+    confirm_delay: Duration,
+    /// The next publishes to decline: they are dropped and answered with basic.nack.
+    nack_remaining: u32,
+    /// When the last delayed confirm is due, so confirms leave in the order they were made.
+    last_confirm_due: Option<tokio::time::Instant>,
 }
 
 fn esc(s: &str) -> String {
@@ -371,6 +377,39 @@ impl Broker {
     /// exclusive is refused, as RabbitMQ 4 does unless `transient_nonexcl_queues` is permitted.
     pub fn set_rabbitmq_major(&mut self, major: u8) {
         self.rabbitmq_major = major;
+    }
+
+    /// Hold every publisher confirm back by `delay`, as a loaded or distant broker does. Confirms keep their order.
+    pub fn set_confirm_delay(&mut self, delay: Duration) {
+        self.confirm_delay = delay;
+    }
+
+    /// Decline the next `count` publishes on channels in confirm mode: the message is dropped and the broker answers basic.nack.
+    pub fn nack_next_publishes(&mut self, count: u32) {
+        self.nack_remaining = count;
+    }
+
+    // Sends a frame now, or after the confirm delay when one is set. Delayed frames keep their order.
+    fn send_confirm(&mut self, conn: ConnId, bytes: Vec<u8>) {
+        if self.confirm_delay.is_zero() {
+            self.send(conn, bytes);
+            return;
+        }
+        let Some(tx) = self.conns.get(&conn).map(|c| c.tx.clone()) else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let mut due = now + self.confirm_delay;
+        if let Some(last) = self.last_confirm_due {
+            if due <= last {
+                due = last + Duration::from_micros(1);
+            }
+        }
+        self.last_confirm_due = Some(due);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(due).await;
+            let _ = tx.send(bytes);
+        });
     }
 
     pub fn new() -> Self {
@@ -1000,9 +1039,20 @@ impl Broker {
         if !self.exchanges.contains_key(exchange) {
             return Err(no_exchange(exchange));
         }
+        // Fault injection: decline this publish. The message is dropped and the publisher is told with basic.nack.
+        let in_confirm_mode = self
+            .chans
+            .get(&(conn, ch))
+            .is_some_and(|c| c.confirm_seq.is_some());
+        let declined = in_confirm_mode && self.nack_remaining > 0;
+        if declined {
+            self.nack_remaining -= 1;
+        }
         let mut qs = Vec::new();
-        self.route(exchange, rk, &msg.headers, &mut qs, &mut HashSet::new());
-        let mut rejected = false;
+        if !declined {
+            self.route(exchange, rk, &msg.headers, &mut qs, &mut HashSet::new());
+        }
+        let mut rejected = declined;
         for qn in &qs {
             if !self.enqueue(qn, &msg) {
                 rejected = true;
@@ -1010,7 +1060,7 @@ impl Broker {
             self.dispatch(qn);
         }
         let frame_max = self.conns.get(&conn).map_or(131072, |c| c.frame_max);
-        if qs.is_empty() && mandatory {
+        if qs.is_empty() && mandatory && !declined {
             let mut b = method(ch, 60, 50, |w| {
                 w.u16(312);
                 w.short("NO_ROUTE");
@@ -1020,20 +1070,21 @@ impl Broker {
             b.extend(content(ch, &msg.props, &msg.body, frame_max));
             self.send(conn, b);
         }
+        let mut confirm = None;
         if let Some(c) = self.chans.get_mut(&(conn, ch)) {
             if let Some(seq) = c.confirm_seq.as_mut() {
                 let tag = *seq;
                 *seq += 1;
-                // basic.nack when a queue rejected the publish (x-overflow=reject-publish), else basic.ack
+                // basic.nack when a queue rejected the publish (x-overflow=reject-publish) or one was declined, else basic.ack
                 let id = if rejected { 120 } else { 80 };
-                self.send(
-                    conn,
-                    method(ch, 60, id, |w| {
-                        w.u64(tag);
-                        w.u8(0);
-                    }),
-                );
+                confirm = Some(method(ch, 60, id, |w| {
+                    w.u64(tag);
+                    w.u8(0);
+                }));
             }
+        }
+        if let Some(frame) = confirm {
+            self.send_confirm(conn, frame);
         }
         Ok(())
     }

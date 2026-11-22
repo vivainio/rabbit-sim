@@ -81,6 +81,33 @@ fn route(method: &str, path: &str, broker: &Shared) -> Vec<u8> {
                 "{\"error\":\"expected ?ms=<milliseconds>\"}",
             ),
         },
+        // POST /chaos/latency?confirm=MS -> hold every publisher confirm back by MS milliseconds (0 confirms at once)
+        ("POST", "/chaos/latency") => match param("confirm").and_then(|v| v.parse::<u64>().ok()) {
+            Some(ms) => {
+                broker
+                    .lock()
+                    .unwrap()
+                    .set_confirm_delay(std::time::Duration::from_millis(ms));
+                json(&format!("{{\"confirm_delay_ms\":{ms}}}"))
+            }
+            None => respond(
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"expected ?confirm=<milliseconds>\"}",
+            ),
+        },
+        // POST /chaos/nack?count=N -> decline the next N publishes on confirm channels: dropped, answered with basic.nack
+        ("POST", "/chaos/nack") => match param("count").and_then(|v| v.parse::<u32>().ok()) {
+            Some(count) => {
+                broker.lock().unwrap().nack_next_publishes(count);
+                json(&format!("{{\"nack_next\":{count}}}"))
+            }
+            None => respond(
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"expected ?count=<number>\"}",
+            ),
+        },
         // POST /chaos/queues/{vhost}/{name}/expire -> expire all ready messages now
         ("POST", p) if p.starts_with("/chaos/queues/") && p.ends_with("/expire") => {
             let mid = &p["/chaos/queues/".len()..p.len() - "/expire".len()];

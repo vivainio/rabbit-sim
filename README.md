@@ -24,6 +24,7 @@ Standalone binaries for Linux, macOS (Intel/Apple Silicon) and Windows are attac
 | `-m, --http-port PORT` | `15672` | management UI/API port, `0` disables it |
 | `-d, --data FILE` | none | SQLite file for persistence; omit for pure in-memory |
 | `-r, --rabbitmq 3\|4` | `3` | emulate the stricter behaviour of a RabbitMQ major version (see below) |
+| `-c, --confirm-delay MS` | `0` | hold every publisher confirm back by MS milliseconds, like a loaded or distant broker |
 | `-v, --verbose` | off | log connects, disconnects and errors |
 
 Any username and password are accepted, and all clients share one vhost.
@@ -69,6 +70,13 @@ Time-dependent behaviour is slow to test, so the broker's TTL clock can be drive
 
     POST /chaos/clock/advance?ms=3600000          # move the TTL clock forward and expire what is due
     POST /chaos/queues/%2F/{name}/expire          # expire every ready message in a queue now
+
+    POST /chaos/latency?confirm=MS                # hold every publisher confirm back by MS ms (0 turns it off)
+    POST /chaos/nack?count=N                      # decline the next N publishes on confirm channels
+
+Confirms are held back in order, so publishes made together are confirmed together after about one delay, and a client that waits for
+a confirm per message becomes visibly slow, as it does on a real broker. A declined publish is dropped and answered with `basic.nack`,
+which is how a test reaches the path where a publisher is not told its message was accepted. Both use real time.
 
 Expired messages are dead-lettered exactly as real expiry would. Only message TTLs use this clock;
 heartbeats and everything else run on real time.
